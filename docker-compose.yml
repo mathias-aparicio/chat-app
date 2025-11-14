@@ -1,0 +1,25 @@
+services:
+  scylladb:
+    image: scylladb/scylla:latest
+    container_name: scylladb
+    ports:
+      - "9042:9042"
+    networks:
+      - scylla-net
+    command: --smp 1 --memory 750M --developer-mode 1
+
+  cquill-migrator:
+    image: 84tech/cquill:latest
+    container_name: cquill-migrator
+    networks:
+      - scylla-net
+    volumes:
+      - ./.cql:/cquill/cql:ro
+    environment:
+      - CASSANDRA_NODE=scylladb
+    command: ["migrate"]
+    depends_on:
+      - scylladb
+
+networks:
+  scylla-net:
