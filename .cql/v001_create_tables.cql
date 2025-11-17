@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS users (
 
 CREATE TABLE IF NOT EXISTS chats (
     chat_id    UUID,
+    members      list<UUID>,
     name       TEXT,
     created_at TIMESTAMP,
     PRIMARY KEY (chat_id)
