@@ -1,8 +1,8 @@
+use crate::schema::{Chat, User};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use scylla::client::{session::Session, session_builder::SessionBuilder};
-use scylla::{DeserializeRow, SerializeRow};
 use uuid::Uuid;
 
 #[async_trait]
@@ -94,31 +94,4 @@ impl Db for ScyllaDb {
 
         Ok(chat)
     }
-}
-
-#[derive(serde::Deserialize)]
-pub struct CreateUser {
-    pub username: String,
-}
-
-#[derive(DeserializeRow, serde::Deserialize, serde::Serialize, PartialEq, Debug, Clone)]
-pub struct User {
-    pub user_id: Uuid,
-    pub username: String,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
-#[derive(DeserializeRow, serde::Deserialize, serde::Serialize, PartialEq, Debug, Clone)]
-pub struct Chat {
-    pub chat_id: Uuid,
-    pub members: Vec<Uuid>,
-    pub name: String,
-    pub created_at: DateTime<Utc>,
-}
-
-#[derive(serde::Deserialize)]
-pub struct CreateChat {
-    pub name: String,
-    pub members: Vec<Uuid>,
 }

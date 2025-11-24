@@ -3,10 +3,14 @@ use tracing_subscriber::EnvFilter;
 
 use crate::handler::create_router;
 
+mod consumer;
 mod db;
 mod handler;
+mod producer;
+mod schema;
 #[tokio::main]
 async fn main() -> Result<()> {
+    // TODO : Allow axum_anyhow errors to fit in the tracing
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,chat_app=debug"));
 
