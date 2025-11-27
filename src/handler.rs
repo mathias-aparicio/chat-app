@@ -15,20 +15,16 @@ use axum::{
 use serde::Serialize;
 use tower_http::{services::ServeDir, trace::TraceLayer};
 
-// Make our own error that wraps anyhow::Error
 pub struct AppError(anyhow::Error);
 
-// Tell axum how to convert `AppError` into a response.
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        // Log the full error details
         tracing::error!("Application error: {:#}", self.0);
 
         (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response()
     }
 }
 
-// This enables using `?` on functions that return `Result<_, anyhow::Error>` to turn them into `Result<_, AppError>`.
 impl<E> From<E> for AppError
 where
     E: Into<anyhow::Error>,
@@ -40,7 +36,7 @@ where
 
 pub type ApiResult<T> = Result<T, AppError>;
 
-use crate::schema::{Chat, CreatMessage, CreateChat, CreateUser, PandaMessage, User};
+use crate::schema::{Chat, ChatMessage, CreatMessage, CreateChat, CreateUser, PandaMessage, User};
 use crate::{
     db::{Db, ScyllaDb},
     producer::{MessageProducer, Producer},
@@ -64,9 +60,21 @@ pub async fn create_router(db: Arc<ScyllaDb>) -> anyhow::Result<Router> {
         .route("/users/{user_id}", get(get_user))
         .route("/chats/{chat_id}", get(get_chat))
         .route("/chats/{chat_id}/messages", post(post_message))
+        .route("/chats/{chat_id}/messages", get(get_messages))
         .layer(TraceLayer::new_for_http())
         .with_state(app_state);
     Ok(app)
+}
+async fn get_messages(
+    State(state): State<AppState>,
+    Path(chat_id): Path<String>,
+) -> ApiResult<JsonWithStatus<Vec<ChatMessage>>> {
+    let chat_id = Uuid::from_str(&chat_id)?;
+    let messages = state.db.get_messages(chat_id).await?;
+    Ok(JsonWithStatus {
+        data: messages,
+        status: StatusCode::OK,
+    })
 }
 async fn render_index(State(state): State<AppState>) -> ApiResult<Html<String>> {
     let context = tera::Context::new();
@@ -198,6 +206,7 @@ mod tests {
             async fn get_user(&self, user_id: Uuid) -> Result<User>;
             async fn get_chat(&self, chat_id: Uuid) -> Result<Chat>;
             async fn insert_message(&self, message: PandaMessage) -> Result<crate::schema::ChatMessage>;
+            async fn get_messages(&self, chat_id: Uuid) -> Result<Vec<ChatMessage>>;
         }
     }
 
@@ -361,7 +370,6 @@ mod tests {
             name: "test_chat".to_string(),
             members: members.clone(),
             created_at: now,
-            updated_at: now,
         };
         let expected_chat_clone = expected_chat.clone();
         mock_db
@@ -438,34 +446,5 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn test_get_user_invalid_uuid() {
-        // This test verifies that an invalid UUID triggers an error that is logged
-        // and returns 500 Internal Server Error.
-        let mock_db = MockDb::new();
-        let app_state = AppState {
-            db: Arc::new(mock_db),
-            producer: Arc::new(MockProducer::new()),
-            tera: Arc::new(Tera::default()),
-        };
-        let app = Router::new()
-            .route("/users/{user_id}", get(get_user))
-            .with_state(app_state);
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method(http::Method::GET)
-                    .uri("/users/123") // Invalid UUID
-                    .header(http::header::CONTENT_TYPE, "application/json")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

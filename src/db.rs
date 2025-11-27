@@ -17,6 +17,7 @@ pub trait Db: Send + Sync {
     async fn create_chat(&self, name: &str, members: &[Uuid]) -> Result<Chat>;
     async fn get_user(&self, user_id: Uuid) -> Result<User>;
     async fn get_chat(&self, chat_id: Uuid) -> Result<Chat>;
+    async fn get_messages(&self, chat_id: Uuid) -> Result<Vec<ChatMessage>>;
 }
 
 pub struct ScyllaDb {
@@ -59,6 +60,21 @@ impl ScyllaDb {
 
 #[async_trait]
 impl Db for ScyllaDb {
+    async fn get_messages(&self, chat_id: Uuid) -> Result<Vec<ChatMessage>> {
+        let messages = self
+            .session
+            .query_unpaged("SELECT * from ks.messages WHERE chat_id = ?", ((chat_id),))
+            .await
+            .context("Failed to execute query")?
+            .into_rows_result()
+            .context("Failed to parse rows result")?
+            .rows()
+            .context("No Rows not found")?
+            // Collect the iterator of Result<Row> into a Result<Vec>
+            // This means that if one select fail all other fail
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(messages)
+    }
     async fn insert_message(&self, message: PandaMessage) -> Result<ChatMessage> {
         let message_id = CqlTimeuuid::from(Uuid::new_v4());
         let chat_id = message.chat_id;

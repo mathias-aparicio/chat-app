@@ -28,7 +28,7 @@ pub struct CreateChat {
     pub members: Vec<Uuid>,
 }
 
-#[derive(serde::Deserialize, serde::Serialize)]
+#[derive(serde::Deserialize, serde::Serialize, DeserializeRow)]
 pub struct ChatMessage {
     pub chat_id: Uuid,
     pub message_id: Uuid,
