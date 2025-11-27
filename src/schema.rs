@@ -29,7 +29,7 @@ pub struct CreateChat {
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
-pub struct Message {
+pub struct ChatMessage {
     pub chat_id: Uuid,
     pub message_id: Uuid,
     pub sender_id: Uuid,
@@ -38,6 +38,11 @@ pub struct Message {
 
 #[derive(DeserializeRow, serde::Deserialize, serde::Serialize, PartialEq, Debug, Clone)]
 pub struct CreatMessage {
+    pub content: String,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct PandaMessage {
+    pub chat_id: Uuid,
     pub sender_id: Uuid,
     pub content: String,
 }

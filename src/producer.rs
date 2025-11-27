@@ -1,4 +1,5 @@
-use crate::schema::{CreatMessage, Message};
+// FIXME : Make sure the id of message is converted to a TimeuiD
+use crate::schema::PandaMessage;
 use anyhow::{Context, Result};
 use rdkafka::{
     ClientConfig,
@@ -13,7 +14,7 @@ use mockall::automock;
 #[cfg_attr(test, automock)]
 #[async_trait]
 pub trait Producer: Send + Sync {
-    async fn send_message(&self, message: CreatMessage) -> Result<()>;
+    async fn send_message(&self, message: PandaMessage) -> Result<()>;
 }
 
 #[derive(Clone)]
@@ -37,7 +38,7 @@ impl MessageProducer {
 
 #[async_trait]
 impl Producer for MessageProducer {
-    async fn send_message(&self, message: CreatMessage) -> Result<()> {
+    async fn send_message(&self, message: PandaMessage) -> Result<()> {
         let payload = serde_json::to_string(&message).context("Failed to deserialize payload")?;
         let sender_id = message.sender_id.to_string();
         self.producer

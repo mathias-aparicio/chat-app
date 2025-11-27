@@ -1,31 +1,64 @@
-use std::sync::Arc;
+use anyhow::anyhow;
+use axum_extra::extract::CookieJar;
+use std::{str::FromStr, sync::Arc};
+use tera::Tera;
+use uuid::Uuid;
 
 use anyhow::Context;
 use axum::{
     Router,
     extract::{Json, Path, State},
     http::StatusCode,
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
-use axum_anyhow::ApiResult;
 use serde::Serialize;
-use tower_http::trace::TraceLayer;
+use tower_http::{services::ServeDir, trace::TraceLayer};
 
-use crate::schema::{Chat, CreatMessage, CreateChat, CreateUser, Message, User};
+// Make our own error that wraps anyhow::Error
+pub struct AppError(anyhow::Error);
+
+// Tell axum how to convert `AppError` into a response.
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        // Log the full error details
+        tracing::error!("Application error: {:#}", self.0);
+
+        (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response()
+    }
+}
+
+// This enables using `?` on functions that return `Result<_, anyhow::Error>` to turn them into `Result<_, AppError>`.
+impl<E> From<E> for AppError
+where
+    E: Into<anyhow::Error>,
+{
+    fn from(err: E) -> Self {
+        Self(err.into())
+    }
+}
+
+pub type ApiResult<T> = Result<T, AppError>;
+
+use crate::schema::{Chat, CreatMessage, CreateChat, CreateUser, PandaMessage, User};
 use crate::{
     db::{Db, ScyllaDb},
     producer::{MessageProducer, Producer},
 };
 
-pub async fn create_router() -> anyhow::Result<Router> {
-    let db = ScyllaDb::new().await?;
-    let db = Arc::new(db);
+pub async fn create_router(db: Arc<ScyllaDb>) -> anyhow::Result<Router> {
     let producer = MessageProducer::new("localhost:19092", "chat-messages")
         .context("Failed to create message producer")?;
     let producer = Arc::new(producer);
-    let app_state = AppState { db, producer };
+    let tera = Tera::new("templates/**/*.html").context("Failed to initialize Tera templating")?;
+    let tera = Arc::new(tera);
+    let app_state = AppState { db, producer, tera };
     let app = Router::new()
+        // UI routes
+        .route("/", get(render_index))
+        // Serving static file
+        .nest_service("/static", ServeDir::new("static"))
+        // API routes
         .route("/users", post(create_user))
         .route("/chats", post(create_chat))
         .route("/users/{user_id}", get(get_user))
@@ -35,14 +68,39 @@ pub async fn create_router() -> anyhow::Result<Router> {
         .with_state(app_state);
     Ok(app)
 }
+async fn render_index(State(state): State<AppState>) -> ApiResult<Html<String>> {
+    let context = tera::Context::new();
+
+    let rendered = state
+        .tera
+        .render("index.html", &context)
+        .map_err(|e| anyhow!("Template rendering failed: {}", e))?;
+
+    Ok(Html(rendered))
+}
 /// sender_id send a message to the chatId chat room from slug
 async fn post_message(
     State(state): State<AppState>,
     Path(chat_id): Path<String>,
+    jar: CookieJar,
     Json(create_message): Json<CreatMessage>,
 ) -> ApiResult<StatusCode> {
-    // FIXME : Make sure the id of message is converted to a TimeuiD
-    state.producer.send_message(create_message).await?;
+    let sender_id = jar
+        .get("sender_id")
+        .ok_or(anyhow!("Failed to get sender_id from cookie"))?
+        .value_trimmed();
+
+    let content = create_message.content;
+    let sender_id = Uuid::parse_str(sender_id)?;
+    let chat_id = Uuid::parse_str(&chat_id)?;
+    state
+        .producer
+        .send_message(PandaMessage {
+            sender_id,
+            content,
+            chat_id,
+        })
+        .await?;
     Ok(StatusCode::OK)
 }
 async fn create_user(
@@ -74,7 +132,8 @@ async fn get_user(
     State(state): State<AppState>,
     Path(user_id): Path<String>,
 ) -> ApiResult<JsonWithStatus<User>> {
-    let user = state.db.get_user(&user_id).await?;
+    let user_id = Uuid::from_str(&user_id).context("Failed to parse user_id from str to UUID")?;
+    let user = state.db.get_user(user_id).await?;
     Ok(JsonWithStatus {
         status: StatusCode::OK,
         data: user,
@@ -84,7 +143,8 @@ async fn get_chat(
     State(state): State<AppState>,
     Path(chat_id): Path<String>,
 ) -> ApiResult<JsonWithStatus<Chat>> {
-    let chat = state.db.get_chat(&chat_id).await?;
+    let chat_id = Uuid::from_str(&chat_id).context("Failed to parse chat_id from str to UUID")?;
+    let chat = state.db.get_chat(chat_id).await?;
     Ok(JsonWithStatus {
         status: StatusCode::OK,
         data: chat,
@@ -108,6 +168,7 @@ struct AppState {
     // Polymorphism  allow testing with the mockall library
     db: Arc<dyn Db>,
     producer: Arc<dyn Producer>,
+    tera: Arc<Tera>,
 }
 #[cfg(test)]
 mod tests {
@@ -134,8 +195,9 @@ mod tests {
         impl Db for Db {
             async fn create_user(&self, username: &str) -> Result<User>;
             async fn create_chat(&self, name: &str, members: &[Uuid]) -> Result<Chat>;
-            async fn get_user(&self, user_id: &str) -> Result<User>;
-            async fn get_chat(&self, chat_id: &str) -> Result<Chat>;
+            async fn get_user(&self, user_id: Uuid) -> Result<User>;
+            async fn get_chat(&self, chat_id: Uuid) -> Result<Chat>;
+            async fn insert_message(&self, message: PandaMessage) -> Result<crate::schema::ChatMessage>;
         }
     }
 
@@ -160,6 +222,7 @@ mod tests {
         let app_state = AppState {
             db: Arc::new(mock_db),
             producer: Arc::new(MockProducer::new()),
+            tera: Arc::new(Tera::default()),
         };
         let app = Router::new()
             .route("/users", post(create_user))
@@ -206,6 +269,7 @@ mod tests {
         let app_state = AppState {
             db: Arc::new(mock_db),
             producer: Arc::new(MockProducer::new()),
+            tera: Arc::new(Tera::default()),
         };
         let app = Router::new()
             .route("/chats", post(create_chat))
@@ -252,7 +316,7 @@ mod tests {
             .expect_get_user()
             // The get_user route will be called with the user_id specificlly from the created mock
             // use we won't insert it we will make an expected return in the next methodr
-            .withf(move |id| id == user_id.to_string())
+            .withf(move |id| *id == user_id)
             // This function will be called exactly one time
             .times(1)
             // We return the exepected user as if we had inserted it in the database
@@ -261,6 +325,7 @@ mod tests {
         let app_state = AppState {
             db: Arc::new(mock_db),
             producer: Arc::new(MockProducer::new()),
+            tera: Arc::new(Tera::default()),
         };
         let app = Router::new()
             .route("/users/{user_id}", get(get_user))
@@ -296,16 +361,18 @@ mod tests {
             name: "test_chat".to_string(),
             members: members.clone(),
             created_at: now,
+            updated_at: now,
         };
         let expected_chat_clone = expected_chat.clone();
         mock_db
             .expect_get_chat()
-            .withf(move |id| id == chat_id.to_string())
+            .withf(move |id| *id == chat_id)
             .times(1)
             .returning(move |_| Ok(expected_chat_clone.clone()));
         let app_state = AppState {
             db: Arc::new(mock_db),
             producer: Arc::new(MockProducer::new()),
+            tera: Arc::new(Tera::default()),
         };
         let app = Router::new()
             .route("/chats/{chat_id}", get(get_chat))
@@ -335,7 +402,6 @@ mod tests {
         let sender_id = Uuid::new_v4();
         let message_content = "Hello, world!".to_string();
         let create_message = CreatMessage {
-            sender_id,
             content: message_content.clone(),
         };
         let create_message_clone = create_message.clone();
@@ -343,8 +409,7 @@ mod tests {
         mock_producer
             .expect_send_message()
             .withf(move |msg| {
-                msg.sender_id == create_message_clone.sender_id
-                    && msg.content == create_message_clone.content
+                msg.sender_id == sender_id && msg.content == create_message_clone.content
             })
             .times(1)
             .returning(|_| Ok(()));
@@ -353,6 +418,7 @@ mod tests {
         let app_state = AppState {
             db: Arc::new(mock_db),
             producer: Arc::new(mock_producer),
+            tera: Arc::new(Tera::default()),
         };
 
         let app = Router::new()
@@ -372,5 +438,34 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_get_user_invalid_uuid() {
+        // This test verifies that an invalid UUID triggers an error that is logged
+        // and returns 500 Internal Server Error.
+        let mock_db = MockDb::new();
+        let app_state = AppState {
+            db: Arc::new(mock_db),
+            producer: Arc::new(MockProducer::new()),
+            tera: Arc::new(Tera::default()),
+        };
+        let app = Router::new()
+            .route("/users/{user_id}", get(get_user))
+            .with_state(app_state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::GET)
+                    .uri("/users/123") // Invalid UUID
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }
