@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block content %}
+    <div class="bg-white shadow-md rounded px-8 pt-6 pb-8 h-fit">
+        <h2 class="text-xl mb-4">My Chats</h2>
+        <ul id="chat-list" class="divide-y divide-gray-200">
+            {% for chat in chats %}
+                {% include "partials/chat_item.html" %}
+            {% else %}
+                <li class="py-4">No chats yet.</li>
+            {% endfor %}
+        </ul>
+    </div>
+    <!-- Create Chat -->
+    <div class="bg-white shadow-md rounded px-8 pt-6 pb-8 h-fit">
+        <h2 class="text-xl mb-4">Create New Chat</h2>
+        <form hx-post="/chats"
+              hx-target="#chat-list"
+              hx-swap="beforeend"
+              hx-on::after-request="this.reset()">
+            <!-- Chat Name Input -->
+            <div class="mb-4">
+                <label class="block text-gray-700 text-sm font-bold mb-2" for="chat-name">Chat Name</label>
+                <input class="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline"
+                       id="chat-name"
+                       name="name"
+                       type="text"
+                       placeholder="Chat Name"
+                       required>
+            </div>
+            <!-- Members Selection -->
+            <div class="mb-4">
+                <label class="block text-gray-700 text-sm font-bold mb-2">
+                    Select Members
+                </label>
+                <div class="grid grid-cols-2 gap-2">
+                {% for user in available_users %}
+                    <label class="flex items-center">
+                        <input type="checkbox" name="members" value="{{ user.user_id }}" class="form-checkbox h-5 w-5 text-blue-600">
+                        <span class="ml-2 text-gray-700">{{ user.username }}</span>
+                    </label>
+                {% else %}
+                    <p>No other users available</p>
+                {% endfor %}
+                </div>
+                <p class="text-xs text-gray-500 mt-1">You are automatically added to the chat.</p>
+            </div>
+            <div class="flex items-center justify-between">
+                <button class="bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded focus:outline-none focus:shadow-outline"
+                        type="submit">Create Chat</button>
+            </div>
+        </form>
+    </div>
+{% endblock content %}

@@ -18,6 +18,9 @@ pub trait Db: Send + Sync {
     async fn get_user(&self, user_id: Uuid) -> Result<User>;
     async fn get_chat(&self, chat_id: Uuid) -> Result<Chat>;
     async fn get_messages(&self, chat_id: Uuid) -> Result<Vec<ChatMessage>>;
+    async fn get_chats_for_user(&self, user_id: Uuid) -> Result<Vec<Chat>>;
+    async fn get_user_by_username(&self, username: &str) -> Result<User>;
+    async fn get_all_users(&self) -> Result<Vec<User>>;
 }
 
 pub struct ScyllaDb {
@@ -60,6 +63,20 @@ impl ScyllaDb {
 
 #[async_trait]
 impl Db for ScyllaDb {
+    // TODO : Factorise function that fetch multiple rows
+    async fn get_all_users(&self) -> Result<Vec<User>> {
+        let users = self
+            .session
+            .query_unpaged("SELECT * FROM ks.users", &[])
+            .await
+            .context("Failed to execute query")?
+            .into_rows_result()
+            .context("Failed to parse rows result")?
+            .rows()
+            .context("No users found")?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(users)
+    }
     async fn get_messages(&self, chat_id: Uuid) -> Result<Vec<ChatMessage>> {
         let messages = self
             .session
@@ -74,6 +91,35 @@ impl Db for ScyllaDb {
             // This means that if one select fail all other fail
             .collect::<Result<Vec<_>, _>>()?;
         Ok(messages)
+    }
+
+    async fn get_chats_for_user(&self, user_id: Uuid) -> Result<Vec<Chat>> {
+        let chats = self
+            .session
+            .query_unpaged(
+                "SELECT * FROM ks.chats WHERE members CONTAINS ? ALLOW FILTERING",
+                ((user_id),),
+            )
+            .await
+            .context("Failed to execute query")?
+            .into_rows_result()
+            .context("Failed to parse rows result")?
+            .rows()
+            .context("No Rows not found")?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(chats)
+    }
+
+    async fn get_user_by_username(&self, username: &str) -> Result<User> {
+        let (user_id,): (Uuid,) = self
+            .fetch_single(
+                "SELECT user_id FROM ks.users_by_username WHERE username = ?",
+                (username,),
+            )
+            .await
+            .context("User not found")?;
+
+        self.get_user(user_id).await
     }
     async fn insert_message(&self, message: PandaMessage) -> Result<ChatMessage> {
         let message_id = CqlTimeuuid::from(Uuid::new_v4());
@@ -101,7 +147,7 @@ impl Db for ScyllaDb {
     }
 
     async fn get_chat(&self, chat_id: Uuid) -> Result<Chat> {
-        self.fetch_single("SELECT * FROM ks.chat WHERE chat_id = ?", (chat_id,))
+        self.fetch_single("SELECT * FROM ks.chats WHERE chat_id = ?", (chat_id,))
             .await
             .context("Could not fetch chat")
     }
@@ -109,6 +155,23 @@ impl Db for ScyllaDb {
     async fn create_user(&self, username: &str) -> Result<User> {
         let now = Utc::now();
         let user_id = Uuid::new_v4();
+
+        // Try to insert into users_by_username first to ensure uniqueness
+        let applied = self
+            .session
+            .query_unpaged(
+                "INSERT INTO ks.users_by_username (username, user_id) VALUES (?, ?) IF NOT EXISTS",
+                (username, user_id),
+            )
+            .await?
+            .into_rows_result()?
+            .first_row::<(bool, Option<String>, Option<Uuid>)>()?
+            .0;
+
+        if !applied {
+            return Err(anyhow::anyhow!("Username '{}' already exists", username));
+        }
+
         let values = (user_id, username, now, now);
         self.insert_data(
             "INSERT INTO ks.users (user_id, username, created_at, updated_at) VALUES (?, ?, ?, ?)",

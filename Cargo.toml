@@ -24,6 +24,8 @@ tower = "0.5.2"
 rdkafka = "0.38.0"
 tera = "1.20.1"
 tokio-stream = "0.1.17"
-axum-extra = { version = "0.12.2", features = ["cookie"] }
+axum-extra = { version = "0.12.2", features = ["cookie", "form"] }
+serde_urlencoded = "0.7.1"
+serde_qs = "0.15.0"
 [dev-dependencies]
 mockall = "0.14.0"

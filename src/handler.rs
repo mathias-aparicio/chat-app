@@ -4,43 +4,25 @@ use std::{str::FromStr, sync::Arc};
 use tera::Tera;
 use uuid::Uuid;
 
-use anyhow::Context;
-use axum::{
-    Router,
-    extract::{Json, Path, State},
-    http::StatusCode,
-    response::{Html, IntoResponse, Response},
-    routing::{get, post},
+use crate::schema::{
+    Chat, ChatMessage, CreatMessage, CreateChat, CreateUser, LoginPayload, PandaMessage, User,
 };
-use serde::Serialize;
-use tower_http::{services::ServeDir, trace::TraceLayer};
-
-pub struct AppError(anyhow::Error);
-
-impl IntoResponse for AppError {
-    fn into_response(self) -> Response {
-        tracing::error!("Application error: {:#}", self.0);
-
-        (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response()
-    }
-}
-
-impl<E> From<E> for AppError
-where
-    E: Into<anyhow::Error>,
-{
-    fn from(err: E) -> Self {
-        Self(err.into())
-    }
-}
-
-pub type ApiResult<T> = Result<T, AppError>;
-
-use crate::schema::{Chat, ChatMessage, CreatMessage, CreateChat, CreateUser, PandaMessage, User};
 use crate::{
     db::{Db, ScyllaDb},
     producer::{MessageProducer, Producer},
 };
+use anyhow::Context;
+use axum::extract::{FromRequest, Request};
+use axum::{
+    Router,
+    extract::{Form, Json, Path, State},
+    http::{HeaderMap, StatusCode},
+    response::{Html, IntoResponse, Redirect, Response},
+    routing::{get, post},
+};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use tower_http::{services::ServeDir, trace::TraceLayer};
 
 pub async fn create_router(db: Arc<ScyllaDb>) -> anyhow::Result<Router> {
     let producer = MessageProducer::new("localhost:19092", "chat-messages")
@@ -52,18 +34,45 @@ pub async fn create_router(db: Arc<ScyllaDb>) -> anyhow::Result<Router> {
     let app = Router::new()
         // UI routes
         .route("/", get(render_index))
-        // Serving static file
-        .nest_service("/static", ServeDir::new("static"))
+        .route("/dashboard", get(dashboard))
         // API routes
+        .route("/logout", get(logout))
+        .route("/login", post(login))
         .route("/users", post(create_user))
         .route("/chats", post(create_chat))
         .route("/users/{user_id}", get(get_user))
         .route("/chats/{chat_id}", get(get_chat))
         .route("/chats/{chat_id}/messages", post(post_message))
         .route("/chats/{chat_id}/messages", get(get_messages))
+        // Serving static file
+        .nest_service("/static", ServeDir::new("static"))
         .layer(TraceLayer::new_for_http())
         .with_state(app_state);
     Ok(app)
+}
+// ----- **** ----
+// Begin of handler definition
+// ----- **** ----
+async fn login(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Form(payload): Form<LoginPayload>,
+) -> ApiResult<impl IntoResponse> {
+    let user = state.db.get_user_by_username(&payload.username).await?;
+
+    let mut cookie = axum_extra::extract::cookie::Cookie::new("user_id", user.user_id.to_string());
+    cookie.set_path("/");
+
+    let jar = jar.add(cookie);
+    Ok((jar, Redirect::to("/")))
+}
+async fn logout(State(state): State<AppState>, jar: CookieJar) -> ApiResult<impl IntoResponse> {
+    let mut cookie = axum_extra::extract::cookie::Cookie::new("user_id", "");
+    cookie.set_path("/");
+
+    cookie.make_removal();
+    let jar = jar.add(cookie);
+    Ok((jar, Redirect::to("/")))
 }
 async fn get_messages(
     State(state): State<AppState>,
@@ -76,17 +85,93 @@ async fn get_messages(
         status: StatusCode::OK,
     })
 }
-async fn render_index(State(state): State<AppState>) -> ApiResult<Html<String>> {
+async fn render_index(
+    State(state): State<AppState>,
+    jar: CookieJar,
+) -> ApiResult<impl IntoResponse> {
+    if jar.get("user_id").is_some() {
+        return Ok(Redirect::to("/dashboard").into_response());
+    }
     let context = tera::Context::new();
+    let rendered = state
+        .tera
+        .render("login.html", &context)
+        .map_err(|e| anyhow!("Template rendering failed: {}", e))?;
+
+    Ok(Html(rendered).into_response())
+}
+
+async fn dashboard(State(state): State<AppState>, jar: CookieJar) -> ApiResult<Html<String>> {
+    let user_id_str = jar
+        .get("user_id")
+        .ok_or(anyhow!("No user_id cookie found"))?
+        .value();
+    let current_user_id = Uuid::from_str(user_id_str)?;
+
+    let chats = state.db.get_chats_for_user(current_user_id).await?;
+
+    let all_users = state.db.get_all_users().await?;
+    let current_user = all_users
+        .iter()
+        .find(|u| u.user_id == current_user_id)
+        .ok_or(anyhow!("Current user not found in database"))?;
+
+    let available_users: Vec<&User> = all_users
+        .iter()
+        .filter(|u| u.user_id != current_user_id)
+        .collect();
+
+    let mut context = tera::Context::new();
+    context.insert("chats", &chats);
+    context.insert("available_users", &available_users);
+    context.insert("current_user", &current_user);
 
     let rendered = state
         .tera
-        .render("index.html", &context)
+        .render("dashboard.html", &context)
         .map_err(|e| anyhow!("Template rendering failed: {}", e))?;
 
     Ok(Html(rendered))
 }
-/// sender_id send a message to the chatId chat room from slug
+
+async fn create_chat(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    jar: CookieJar,
+    // axum_extra form support multiple values
+    axum_extra::extract::Form(payload): axum_extra::extract::Form<CreateChat>,
+) -> ApiResult<Response> {
+    let user_id = jar
+        .get("user_id")
+        .ok_or(anyhow!("No user_id cookie found"))?
+        .value();
+    let user_id = Uuid::from_str(user_id)?;
+
+    let mut members = payload.members.clone();
+
+    if !members.contains(&user_id) {
+        members.push(user_id);
+    }
+
+    let chat: Chat = state.db.create_chat(&payload.name, &members).await?;
+
+    if headers.contains_key("hx-request") {
+        let mut context = tera::Context::new();
+        context.insert("chat", &chat);
+        let rendered = state
+            .tera
+            .render("partials/chat_item.html", &context)
+            .map_err(|e| anyhow!("Template rendering failed: {}", e))?;
+        return Ok(Html(rendered).into_response());
+    }
+
+    Ok(JsonWithStatus {
+        status: StatusCode::CREATED,
+        data: chat,
+    }
+    .into_response())
+}
+
 async fn post_message(
     State(state): State<AppState>,
     Path(chat_id): Path<String>,
@@ -113,29 +198,39 @@ async fn post_message(
 }
 async fn create_user(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    jar: CookieJar,
     Json(payload): Json<CreateUser>,
-) -> ApiResult<JsonWithStatus<User>> {
-    let user: User = state.db.create_user(&payload.username).await?;
-    Ok(JsonWithStatus {
-        status: StatusCode::CREATED,
-        data: user,
-    })
+) -> ApiResult<Response> {
+    match state.db.create_user(&payload.username).await {
+        Ok(user) => {
+            if headers.contains_key("hx-request") {
+                let jar = jar.add(axum_extra::extract::cookie::Cookie::new(
+                    "user_id",
+                    user.user_id.to_string(),
+                ));
+                // HTMX redirect via header or just redirect
+                return Ok((jar, Redirect::to("/dashboard")).into_response());
+            }
+            Ok(JsonWithStatus {
+                status: StatusCode::CREATED,
+                data: user,
+            }
+            .into_response())
+        }
+        Err(e) => {
+            if headers.contains_key("hx-request") {
+                // Return error message div
+                return Ok(Html(format!(
+                    "<div class='error'>Error creating user: {}</div>",
+                    e
+                ))
+                .into_response());
+            }
+            Err(e.into())
+        }
+    }
 }
-
-async fn create_chat(
-    State(state): State<AppState>,
-    Json(payload): Json<CreateChat>,
-) -> ApiResult<JsonWithStatus<Chat>> {
-    let chat: Chat = state
-        .db
-        .create_chat(&payload.name, &payload.members)
-        .await?;
-    Ok(JsonWithStatus {
-        status: StatusCode::CREATED,
-        data: chat,
-    })
-}
-
 async fn get_user(
     State(state): State<AppState>,
     Path(user_id): Path<String>,
@@ -158,6 +253,11 @@ async fn get_chat(
         data: chat,
     })
 }
+
+// ----- **** ----
+// // End of handler definition
+// ----- **** ----
+
 pub struct JsonWithStatus<T> {
     pub status: StatusCode,
     pub data: T,
@@ -178,6 +278,26 @@ struct AppState {
     producer: Arc<dyn Producer>,
     tera: Arc<Tera>,
 }
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        tracing::error!("Application error: {:#}", self.0);
+
+        (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response()
+    }
+}
+
+impl<E> From<E> for AppError
+where
+    E: Into<anyhow::Error>,
+{
+    fn from(err: E) -> Self {
+        Self(err.into())
+    }
+}
+pub struct AppError(anyhow::Error);
+
+pub type ApiResult<T> = Result<T, AppError>;
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -207,6 +327,9 @@ mod tests {
             async fn get_chat(&self, chat_id: Uuid) -> Result<Chat>;
             async fn insert_message(&self, message: PandaMessage) -> Result<crate::schema::ChatMessage>;
             async fn get_messages(&self, chat_id: Uuid) -> Result<Vec<ChatMessage>>;
+            async fn get_chats_for_user(&self, user_id: Uuid) -> Result<Vec<Chat>>;
+            async fn get_user_by_username(&self, username: &str) -> Result<User>;
+            async fn get_all_users(&self) -> Result<Vec<User>>;
         }
     }
 

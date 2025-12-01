@@ -40,6 +40,10 @@ pub struct ChatMessage {
 pub struct CreatMessage {
     pub content: String,
 }
+#[derive(serde::Deserialize, serde::Serialize)]
+pub struct LoginPayload {
+    pub username: String,
+}
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct PandaMessage {
     pub chat_id: Uuid,
