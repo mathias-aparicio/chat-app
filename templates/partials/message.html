@@ -1,0 +1,8 @@
+<div id="msg-{{ message.message_id }}" class="flex flex-col space-y-1 mb-4 {% if message.sender_id == user_id %}items-end{% else %}items-start{% endif %}" hx-swap-oob="beforeend:#chat_box">
+    <div class="px-4 py-2 rounded-lg max-w-xs lg:max-w-md {% if message.sender_id == user_id %}bg-blue-500 text-white{% else %}bg-gray-200 text-gray-900{% endif %}">
+        {{ message.content }}
+    </div>
+    <span class="text-xs text-gray-500">
+        {% if message.sender_id == user_id %}You{% else %}{{ message.sender_id }}{% endif %}
+    </span>
+</div>

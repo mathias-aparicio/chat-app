@@ -20,17 +20,25 @@ pub async fn handle_socket(socket: WebSocket, state: AppState, user_id: Uuid) {
         .insert(user_id, channel_sender);
 
     // Spawn a task to receive the messages and send them over websocket
+    let tera = state.tera.clone();
     let send_task = tokio::spawn(async move {
         while let Some(msg) = channel_receiver.recv().await {
-            // Serialize to bytes
-            if let Ok(json_msg) = serde_json::to_string(&msg) {
-                // Send the message or close the connection if error
-                if socket_sender
-                    .send(ws::Message::Text(json_msg.into()))
-                    .await
-                    .is_err()
-                {
-                    break; // Client disconnected
+            let mut context = tera::Context::new();
+            context.insert("message", &msg);
+            context.insert("user_id", &user_id);
+
+            match tera.render("partials/message.html", &context) {
+                Ok(rendered) => {
+                    if socket_sender
+                        .send(ws::Message::Text(rendered.into()))
+                        .await
+                        .is_err()
+                    {
+                        break; // Client disconnected
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Template rendering failed: {}", e);
                 }
             }
         }

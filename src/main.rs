@@ -21,6 +21,8 @@ mod handler;
 mod producer;
 mod schema;
 mod websocket;
+// FIXME : Change me to something random
+pub const NODE_ID: [u8; 6] = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
 type UserSender = mpsc::Sender<PandaMessage>;
 // We use a Rwlock and not a Mutex because tokio::sync::Rwlock for frequent read, less frequent
 // write
@@ -46,7 +48,6 @@ async fn main() -> Result<()> {
     let connections_map: ConnectionMap = Arc::new(RwLock::new(HashMap::new()));
     let tera = Arc::new(Tera::new("templates/**/*.html")?);
     let producer = Arc::new(MessageProducer::new("localhost:19092", "chat-messages")?);
-
     let app_state = AppState {
         db: db_router,
         producer: producer.clone(),
@@ -75,7 +76,8 @@ async fn main() -> Result<()> {
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     println!("Listening on port {}", addr);
-    // TODO : Implement gracefull shutdown
+    // FIXME : Implement gracefull shutdown
+    // ULTRA URGENT IF YOU DON'T FIX IT A SINGLE DATABASE ERROR CRASH THE SERVER FOR EVERYONE
     tokio::select! {
         result = axum::serve(listener, app) => {
             if let Err(e) = result {

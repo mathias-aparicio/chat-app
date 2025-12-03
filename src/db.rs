@@ -1,10 +1,13 @@
-use crate::schema::{Chat, ChatMessage, PandaMessage, User};
+use crate::{
+    NODE_ID,
+    schema::{Chat, PandaMessage, RawPandaMessage, User},
+};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
 use scylla::{
     client::{session::Session, session_builder::SessionBuilder},
-    deserialize::row::DeserializeRow,
+    deserialize::row::DeserializeRow as DeserializeRowTrait,
     serialize::row::SerializeRow,
     value::CqlTimeuuid,
 };
@@ -12,12 +15,12 @@ use uuid::Uuid;
 
 #[async_trait]
 pub trait Db: Send + Sync {
-    async fn insert_message(&self, message: PandaMessage) -> Result<ChatMessage>;
+    async fn insert_message(&self, message: PandaMessage) -> Result<PandaMessage>;
     async fn create_user(&self, username: &str) -> Result<User>;
     async fn create_chat(&self, name: &str, members: &[Uuid]) -> Result<Chat>;
     async fn get_user(&self, user_id: Uuid) -> Result<User>;
     async fn get_chat(&self, chat_id: Uuid) -> Result<Chat>;
-    async fn get_messages(&self, chat_id: Uuid) -> Result<Vec<ChatMessage>>;
+    async fn get_messages(&self, chat_id: Uuid) -> Result<Vec<PandaMessage>>;
     async fn get_chats_for_user(&self, user_id: Uuid) -> Result<Vec<Chat>>;
     async fn get_user_by_username(&self, username: &str) -> Result<User>;
     async fn get_all_users(&self) -> Result<Vec<User>>;
@@ -40,7 +43,7 @@ impl ScyllaDb {
     /// Generic helper to execute a SELECT statement     
     async fn fetch_single<T>(&self, query: &str, values: impl SerializeRow) -> Result<T>
     where
-        T: for<'f, 'm> DeserializeRow<'f, 'm>,
+        T: for<'f, 'm> DeserializeRowTrait<'f, 'm>,
     {
         self.session
             .query_unpaged(query, values)
@@ -90,19 +93,29 @@ impl Db for ScyllaDb {
 
         Ok(members)
     }
-    async fn get_messages(&self, chat_id: Uuid) -> Result<Vec<ChatMessage>> {
-        let messages = self
+    async fn get_messages(&self, chat_id: Uuid) -> Result<Vec<PandaMessage>> {
+        // Because Uuid can not be compared with a Timeuuid and serialize it back
+        let rows_result = self
             .session
-            .query_unpaged("SELECT * from ks.messages WHERE chat_id = ?", ((chat_id),))
+            .query_unpaged(
+                "SELECT chat_id, sender_id, content, message_id FROM ks.messages WHERE chat_id = ?",
+                (chat_id,),
+            )
             .await
             .context("Failed to execute query")?
             .into_rows_result()
-            .context("Failed to parse rows result")?
-            .rows()
-            .context("No Rows not found")?
-            // Collect the iterator of Result<Row> into a Result<Vec>
-            // This means that if one select fail all other fail
+            .context("Failed to parse rows result")?;
+
+        let messages = rows_result
+            .rows::<RawPandaMessage>()
+            .context("Failed to access rows iterator")?
+            .map(|row_result| {
+                row_result
+                    .map(|raw| raw.to_panda_message())
+                    .context("Failed to deserialize row")
+            })
             .collect::<Result<Vec<_>, _>>()?;
+
         Ok(messages)
     }
 
@@ -134,19 +147,19 @@ impl Db for ScyllaDb {
 
         self.get_user(user_id).await
     }
-    async fn insert_message(&self, message: PandaMessage) -> Result<ChatMessage> {
-        let message_id = CqlTimeuuid::from(Uuid::new_v4());
+    async fn insert_message(&self, message: PandaMessage) -> Result<PandaMessage> {
+        let message_id = CqlTimeuuid::from(message.message_id);
         let chat_id = message.chat_id;
         let sender_id = message.sender_id;
         let content = message.content;
         let values = (message_id, chat_id, sender_id, content.clone());
         self.insert_data(
-            "INSERT INTO ks.messages (message_id, chat_id, sender_id, content)",
+            "INSERT INTO ks.messages (message_id, chat_id, sender_id, content) VALUES (?, ?, ?, ?)",
             values,
         )
         .await?;
         let message_id = Uuid::from(message_id);
-        Ok(ChatMessage {
+        Ok(PandaMessage {
             message_id,
             content,
             chat_id,
@@ -167,7 +180,7 @@ impl Db for ScyllaDb {
 
     async fn create_user(&self, username: &str) -> Result<User> {
         let now = Utc::now();
-        let user_id = Uuid::new_v4();
+        let user_id = Uuid::now_v1(&NODE_ID);
 
         // Try to insert into users_by_username first to ensure uniqueness
         let applied = self
@@ -203,7 +216,7 @@ impl Db for ScyllaDb {
 
     async fn create_chat(&self, name: &str, members: &[Uuid]) -> Result<Chat> {
         let now = Utc::now();
-        let chat_id = Uuid::new_v4();
+        let chat_id = Uuid::now_v1(&NODE_ID);
 
         let values = (chat_id, members, name, now);
 

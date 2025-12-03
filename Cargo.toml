@@ -7,7 +7,7 @@ edition = "2024"
 chrono = { version = "0.4.42", features = ["serde"] }
 axum = { version = "0.8.6", features = ["macros", "ws"] }
 tokio = { version = "1.12", features = ["full"] }
-uuid = { version = "1.18", features = ["serde"] }
+uuid = { version = "1.18", features = ["serde", "fast-rng", "v1"] }
 tracing = "0.1.36"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 tower-http = { version = "0.6.6", features = ["fs", "trace"] }
