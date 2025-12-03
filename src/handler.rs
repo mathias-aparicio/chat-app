@@ -1,18 +1,11 @@
-use anyhow::anyhow;
-use axum_extra::extract::CookieJar;
-use std::{str::FromStr, sync::Arc};
-use tera::Tera;
-use uuid::Uuid;
-
+use crate::AppState;
 use crate::schema::{
     Chat, ChatMessage, CreatMessage, CreateChat, CreateUser, LoginPayload, PandaMessage, User,
 };
-use crate::{
-    db::{Db, ScyllaDb},
-    producer::{MessageProducer, Producer},
-};
+use crate::websocket::handle_socket;
 use anyhow::Context;
-use axum::extract::{FromRequest, Request};
+use anyhow::anyhow;
+use axum::extract::WebSocketUpgrade;
 use axum::{
     Router,
     extract::{Form, Json, Path, State},
@@ -20,17 +13,13 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
+use axum_extra::extract::CookieJar;
 use serde::Serialize;
-use serde::de::DeserializeOwned;
+use std::str::FromStr;
 use tower_http::{services::ServeDir, trace::TraceLayer};
+use uuid::Uuid;
 
-pub async fn create_router(db: Arc<ScyllaDb>) -> anyhow::Result<Router> {
-    let producer = MessageProducer::new("localhost:19092", "chat-messages")
-        .context("Failed to create message producer")?;
-    let producer = Arc::new(producer);
-    let tera = Tera::new("templates/**/*.html").context("Failed to initialize Tera templating")?;
-    let tera = Arc::new(tera);
-    let app_state = AppState { db, producer, tera };
+pub async fn create_router(state: AppState) -> anyhow::Result<Router> {
     let app = Router::new()
         // UI routes
         .route("/", get(render_index))
@@ -44,15 +33,26 @@ pub async fn create_router(db: Arc<ScyllaDb>) -> anyhow::Result<Router> {
         .route("/chats/{chat_id}", get(get_chat))
         .route("/chats/{chat_id}/messages", post(post_message))
         .route("/chats/{chat_id}/messages", get(get_messages))
+        .route("/ws/connect/{user_id}", get(get_websocket))
         // Serving static file
         .nest_service("/static", ServeDir::new("static"))
         .layer(TraceLayer::new_for_http())
-        .with_state(app_state);
+        .with_state(state);
     Ok(app)
 }
 // ----- **** ----
 // Begin of handler definition
 // ----- **** ----
+
+async fn get_websocket(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    Path(user_id): Path<String>,
+) -> ApiResult<impl IntoResponse> {
+    let user_id = Uuid::from_str(&user_id)?;
+    Ok(ws.on_upgrade(move |socket| handle_socket(socket, state, user_id)))
+}
+
 async fn login(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -66,7 +66,7 @@ async fn login(
     let jar = jar.add(cookie);
     Ok((jar, Redirect::to("/")))
 }
-async fn logout(State(state): State<AppState>, jar: CookieJar) -> ApiResult<impl IntoResponse> {
+async fn logout(State(_state): State<AppState>, jar: CookieJar) -> ApiResult<impl IntoResponse> {
     let mut cookie = axum_extra::extract::cookie::Cookie::new("user_id", "");
     cookie.set_path("/");
 
@@ -271,17 +271,9 @@ where
         (self.status, Json(self.data)).into_response()
     }
 }
-#[derive(Clone)]
-struct AppState {
-    // Polymorphism  allow testing with the mockall library
-    db: Arc<dyn Db>,
-    producer: Arc<dyn Producer>,
-    tera: Arc<Tera>,
-}
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         tracing::error!("Application error: {:#}", self.0);
-
         (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response()
     }
 }
@@ -351,10 +343,12 @@ mod tests {
             .times(1)
             .returning(move |_| Ok(expected_user_clone.clone()));
 
+        let connections_map = ConnectionMap::new(RwLock::new(HashMap::new()));
         let app_state = AppState {
             db: Arc::new(mock_db),
             producer: Arc::new(MockProducer::new()),
             tera: Arc::new(Tera::default()),
+            connections_map,
         };
         let app = Router::new()
             .route("/users", post(create_user))
@@ -398,10 +392,12 @@ mod tests {
             .times(1)
             .returning(move |_, _| Ok(expected_chat_clone.clone()));
 
+        let connections_map = ConnectionMap::new(RwLock::new(HashMap::new()));
         let app_state = AppState {
             db: Arc::new(mock_db),
             producer: Arc::new(MockProducer::new()),
             tera: Arc::new(Tera::default()),
+            connections_map,
         };
         let app = Router::new()
             .route("/chats", post(create_chat))
@@ -454,10 +450,12 @@ mod tests {
             // We return the exepected user as if we had inserted it in the database
             .returning(move |_| Ok(clone_expected_user.clone()));
 
+        let connections_map = ConnectionMap::new(HashMap::new());
         let app_state = AppState {
             db: Arc::new(mock_db),
             producer: Arc::new(MockProducer::new()),
             tera: Arc::new(Tera::default()),
+            connections_map,
         };
         let app = Router::new()
             .route("/users/{user_id}", get(get_user))
@@ -500,10 +498,12 @@ mod tests {
             .withf(move |id| *id == chat_id)
             .times(1)
             .returning(move |_| Ok(expected_chat_clone.clone()));
+        let connections_map = ConnectionMap::new(HashMap::new());
         let app_state = AppState {
             db: Arc::new(mock_db),
             producer: Arc::new(MockProducer::new()),
             tera: Arc::new(Tera::default()),
+            connections_map,
         };
         let app = Router::new()
             .route("/chats/{chat_id}", get(get_chat))
@@ -546,10 +546,12 @@ mod tests {
             .returning(|_| Ok(()));
 
         let mock_db = MockDb::new(); // We don't need db for this test but AppState needs it
+        let connections_map = ConnectionMap::new(HashMap::new());
         let app_state = AppState {
             db: Arc::new(mock_db),
-            producer: Arc::new(mock_producer),
+            producer: Arc::new(MockProducer::new()),
             tera: Arc::new(Tera::default()),
+            connections_map,
         };
 
         let app = Router::new()

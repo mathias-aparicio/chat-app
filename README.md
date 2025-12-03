@@ -1,5 +1,12 @@
 # Messaging App
 
+## Starting the server
+
+```bash
+./init-db.sh
+cargo run
+```
+
 ## What does the app do
 
 1. Alice send "hi" to Bob
@@ -19,12 +26,4 @@
   - push the message to Bob Websocket
 - If Bob is offline
   - simply stored in the database
-  - upon Bob connection his client will establish a connetion via `/ws/connect/{userId}` and `GET` `/chats/{chatID}/message` to fetch the conversation.
-
-## Testing the endpoints
-
-```bash
-./init-db.sh
-cargo run
-hurl --test tests/test_endpoint.hu
-```
+  - upon Bob connection his client will establish a connection via `/ws/connect/{userId}` and `GET` `/chats/{chatID}/message` to fetch the conversation.

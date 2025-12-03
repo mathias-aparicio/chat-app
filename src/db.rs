@@ -21,6 +21,7 @@ pub trait Db: Send + Sync {
     async fn get_chats_for_user(&self, user_id: Uuid) -> Result<Vec<Chat>>;
     async fn get_user_by_username(&self, username: &str) -> Result<User>;
     async fn get_all_users(&self) -> Result<Vec<User>>;
+    async fn get_members_of_chat(&self, chat_id: Uuid) -> Result<Vec<Uuid>>;
 }
 
 pub struct ScyllaDb {
@@ -76,6 +77,18 @@ impl Db for ScyllaDb {
             .context("No users found")?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(users)
+    }
+
+    async fn get_members_of_chat(&self, chat_id: Uuid) -> Result<Vec<Uuid>> {
+        let (members,): (Vec<Uuid>,) = self
+            .fetch_single(
+                "SELECT members from ks.chats WHERE chat_id = ?",
+                ((chat_id),),
+            )
+            .await
+            .context("Could not fetch members of chat")?;
+
+        Ok(members)
     }
     async fn get_messages(&self, chat_id: Uuid) -> Result<Vec<ChatMessage>> {
         let messages = self

@@ -44,7 +44,7 @@ pub struct CreatMessage {
 pub struct LoginPayload {
     pub username: String,
 }
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct PandaMessage {
     pub chat_id: Uuid,
     pub sender_id: Uuid,
