@@ -2,6 +2,7 @@
 
 use axum::extract::ws::{self, WebSocket};
 use futures_util::{sink::SinkExt, stream::StreamExt};
+use metrics::gauge;
 use tokio::sync::mpsc::channel;
 use uuid::Uuid;
 
@@ -9,10 +10,11 @@ use crate::AppState;
 /// The handler recieve message from the user_id associated mpsc::Sender
 /// It writes them on the tcp socket
 pub async fn handle_socket(socket: WebSocket, state: AppState, user_id: Uuid) {
+    gauge!("active_websocket_users").increment(1.0);
     let (mut socket_sender, mut socket_reciever) = socket.split();
 
     // Insert a sender for redpanda topic to give messages
-    let (channel_sender, mut channel_receiver) = channel(128);
+    let (channel_sender, mut channel_receiver) = channel(8192);
     state
         .connections_map
         .write()
@@ -53,5 +55,6 @@ pub async fn handle_socket(socket: WebSocket, state: AppState, user_id: Uuid) {
 
     send_task.abort();
 
+    gauge!("active_websocket_users").decrement(1.0);
     state.connections_map.write().await.remove(&user_id);
 }

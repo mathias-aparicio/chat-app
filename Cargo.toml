@@ -4,12 +4,18 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+axum-prometheus = "0.9.0"
+metrics = { version = "0.24.3", features = [] }
+metrics-exporter-prometheus = "0.18.0"
 chrono = { version = "0.4.42", features = ["serde"] }
 axum = { version = "0.8.6", features = ["macros", "ws"] }
 tokio = { version = "1.12", features = ["full"] }
 uuid = { version = "1.18", features = ["serde", "fast-rng", "v1"] }
 tracing = "0.1.36"
-tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3.20", features = [
+  "env-filter",
+  "registry",
+] }
 tower-http = { version = "0.6.6", features = ["fs", "trace"] }
 anyhow = "1.0.100"
 serde = { version = "1.0.100", features = ["derive"] }
@@ -25,6 +31,14 @@ axum-extra = { version = "0.12.2", features = [
   "typed-header",
 ] }
 futures-util = "0.3.31"
+tokio-util = "0.7.17"
+console-subscriber = "0.5.0"
+opentelemetry = "0.31.0"
+opentelemetry_sdk = { version = "0.31.0", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.31.0", features = ["grpc-tonic"] }
+tracing-opentelemetry = "0.32.0"
+
+
 [dev-dependencies]
 mockall = "0.14.0"
 tower = "0.5.2"

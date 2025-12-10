@@ -28,3 +28,8 @@ CREATE TABLE IF NOT EXISTS messages (
     content    TEXT,
     PRIMARY KEY (chat_id, message_id)
 ) WITH CLUSTERING ORDER BY (message_id DESC);
+
+CREATE TABLE IF NOT EXISTS users_by_username (
+    username text PRIMARY KEY,
+    user_id uuid
+);

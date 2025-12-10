@@ -1,15 +1,15 @@
 // FIXME : Make sure the id of message is converted to a TimeuiD
-use crate::schema::PandaMessage;
 use anyhow::{Context, Result};
+use async_trait::async_trait;
+#[cfg(test)]
+use mockall::automock;
 use rdkafka::{
     ClientConfig,
     producer::{FutureProducer, FutureRecord},
     util::Timeout,
 };
 
-use async_trait::async_trait;
-#[cfg(test)]
-use mockall::automock;
+use crate::schema::PandaMessage;
 
 #[cfg_attr(test, automock)]
 #[async_trait]

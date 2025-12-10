@@ -1,7 +1,3 @@
-use crate::{
-    NODE_ID,
-    schema::{Chat, PandaMessage, RawPandaMessage, User},
-};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -12,6 +8,11 @@ use scylla::{
     value::CqlTimeuuid,
 };
 use uuid::Uuid;
+
+use crate::{
+    NODE_ID,
+    schema::{Chat, PandaMessage, RawPandaMessage, User},
+};
 
 #[async_trait]
 pub trait Db: Send + Sync {
@@ -32,9 +33,9 @@ pub struct ScyllaDb {
 }
 
 impl ScyllaDb {
-    pub async fn new() -> Result<Self> {
+    pub async fn new(host: &str) -> Result<Self> {
         let session = SessionBuilder::new()
-            .known_node("127.0.0.1:9042")
+            .known_node(host)
             .use_keyspace("ks", false)
             .build()
             .await?;

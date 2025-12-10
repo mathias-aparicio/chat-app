@@ -1,0 +1,123 @@
+{
+   "panels": [
+      {
+         "datasource": {
+            "type": "datasource",
+            "uid": "-- Mixed --"
+         },
+         "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 0
+         },
+         "id": 1,
+         "pluginVersion": "v11.4.0",
+         "targets": [
+            {
+               "datasource": {
+                  "type": "prometheus",
+                  "uid": "prometheus_ds"
+               },
+               "expr": "sum(rate(chat_messages_posted_total[30s]))",
+               "legendFormat": "Input (HTTP/s)"
+            },
+            {
+               "datasource": {
+                  "type": "prometheus",
+                  "uid": "prometheus_ds"
+               },
+               "expr": "sum(rate(consumer_messages_processed_total[30s]))",
+               "legendFormat": "Output (Processed/s)"
+            }
+         ],
+         "title": "Throughput Rates",
+         "type": "timeseries"
+      },
+      {
+         "datasource": {
+            "type": "datasource",
+            "uid": "-- Mixed --"
+         },
+         "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 0
+         },
+         "id": 2,
+         "pluginVersion": "v11.4.0",
+         "targets": [
+            {
+               "datasource": {
+                  "type": "prometheus",
+                  "uid": "prometheus_ds"
+               },
+               "expr": "sum(consumer_lag)",
+               "legendFormat": "Pending Messages"
+            }
+         ],
+         "title": "Consumer Lag",
+         "type": "timeseries"
+      },
+      {
+         "datasource": {
+            "type": "datasource",
+            "uid": "-- Mixed --"
+         },
+         "fieldConfig": {
+            "defaults": {
+               "unit": "s"
+            }
+         },
+         "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 8
+         },
+         "id": 3,
+         "pluginVersion": "v11.4.0",
+         "targets": [
+            {
+               "datasource": {
+                  "type": "prometheus",
+                  "uid": "prometheus_ds"
+               },
+               "expr": "sum(rate(consumer_processing_duration_seconds_sum[1m])) / sum(rate(consumer_processing_duration_seconds_count[1m]))",
+               "legendFormat": "Total Loop Latency"
+            },
+            {
+               "datasource": {
+                  "type": "prometheus",
+                  "uid": "prometheus_ds"
+               },
+               "expr": "sum(rate(consumer_db_duration_seconds_sum[1m])) / sum(rate(consumer_db_duration_seconds_count[1m]))",
+               "legendFormat": "DB Insert Latency"
+            },
+            {
+               "datasource": {
+                  "type": "prometheus",
+                  "uid": "prometheus_ds"
+               },
+               "expr": "sum(rate(consumer_broadcast_duration_seconds_sum[1m])) / sum(rate(consumer_broadcast_duration_seconds_count[1m]))",
+               "legendFormat": "Broadcast Latency"
+            }
+         ],
+         "title": "Processing Breakdown (Latency)",
+         "type": "timeseries"
+      }
+   ],
+   "schemaVersion": 39,
+   "tags": [
+      "chat",
+      "performance"
+   ],
+   "time": {
+      "from": "now-6h",
+      "to": "now"
+   },
+   "timezone": "browser",
+   "title": "Chat App - Performance Analysis",
+   "uid": "chat-app-perf"
+}

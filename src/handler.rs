@@ -1,24 +1,29 @@
-use crate::AppState;
-use crate::NODE_ID;
-use crate::schema::{Chat, CreatMessage, CreateChat, CreateUser, LoginPayload, PandaMessage, User};
-use crate::websocket::handle_socket;
-use anyhow::Context;
-use anyhow::anyhow;
-use axum::extract::WebSocketUpgrade;
+use std::str::FromStr;
+
+use crate::{
+    AppState, NODE_ID,
+    schema::{Chat, CreatMessage, CreateChat, CreateUser, LoginPayload, PandaMessage, User},
+    websocket::handle_socket,
+};
+use anyhow::{Context, anyhow};
 use axum::{
     Router,
-    extract::{Form, Json, Path, State},
+    extract::{Form, Json, Path, State, WebSocketUpgrade},
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
 use axum_extra::extract::CookieJar;
+use axum_prometheus::PrometheusMetricLayer;
+use metrics::counter;
 use serde::Serialize;
-use std::str::FromStr;
 use tower_http::{services::ServeDir, trace::TraceLayer};
 use uuid::Uuid;
 
-pub async fn create_router(state: AppState) -> anyhow::Result<Router> {
+pub async fn create_router(
+    state: AppState,
+    prometheus_layer: PrometheusMetricLayer<'static>,
+) -> anyhow::Result<Router> {
     let app = Router::new()
         // UI routes
         .route("/", get(render_index))
@@ -34,9 +39,10 @@ pub async fn create_router(state: AppState) -> anyhow::Result<Router> {
         .route("/chats/{chat_id}/messages", post(post_message))
         .route("/chats/{chat_id}/messages", get(get_messages))
         .route("/ws/connect/{user_id}", get(get_websocket))
-        // Serving static file
+        // Serving static file and Prometheus
         .nest_service("/static", ServeDir::new("static"))
         .layer(TraceLayer::new_for_http())
+        .layer(prometheus_layer)
         .with_state(state);
     Ok(app)
 }
@@ -101,21 +107,24 @@ async fn render_index(
     Ok(Html(rendered).into_response())
 }
 
-async fn dashboard(State(state): State<AppState>, jar: CookieJar) -> ApiResult<Html<String>> {
-    let user_id_str = jar
-        .get("user_id")
-        .ok_or(anyhow!("No user_id cookie found"))?
-        .value();
-    let current_user_id = Uuid::from_str(user_id_str)?;
+async fn dashboard(State(state): State<AppState>, jar: CookieJar) -> ApiResult<impl IntoResponse> {
+    let user_id_str = match jar.get("user_id") {
+        Some(cookie) => cookie.value(),
+        None => return Ok(Redirect::to("/").into_response()),
+    };
+
+    let current_user_id = match Uuid::from_str(user_id_str) {
+        Ok(id) => id,
+        Err(_) => return Ok(Redirect::to("/logout").into_response()),
+    };
 
     let chats = state.db.get_chats_for_user(current_user_id).await?;
 
     let all_users = state.db.get_all_users().await?;
-    let current_user = all_users
-        .iter()
-        .find(|u| u.user_id == current_user_id)
-        .ok_or(anyhow!("Current user not found in database"))?;
-
+    let current_user = match all_users.iter().find(|u| u.user_id == current_user_id) {
+        Some(u) => u,
+        None => return Ok(Redirect::to("/logout").into_response()),
+    };
     let available_users: Vec<&User> = all_users
         .iter()
         .filter(|u| u.user_id != current_user_id)
@@ -131,7 +140,7 @@ async fn dashboard(State(state): State<AppState>, jar: CookieJar) -> ApiResult<H
         .render("dashboard.html", &context)
         .map_err(|e| anyhow!("Template rendering failed: {}", e))?;
 
-    Ok(Html(rendered))
+    Ok(Html(rendered).into_response())
 }
 
 async fn create_chat(
@@ -198,6 +207,11 @@ async fn post_message(
         })
         .await?;
 
+    counter!(
+        "chat_messages_posted_total",
+            "chat_id" => chat_id.to_string()
+    )
+    .increment(1);
     if headers.contains_key("hx-request") {
         return Ok(StatusCode::OK.into_response());
     }
@@ -328,10 +342,8 @@ pub type ApiResult<T> = Result<T, AppError>;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::db::Db;
-    use crate::producer::MockProducer;
-    use crate::{AppState, ConnectionMap};
+    use std::{collections::HashMap, sync::Arc};
+
     use anyhow::Result;
     use async_trait::async_trait;
     use axum::{
@@ -345,12 +357,13 @@ mod tests {
     use mockall::mock;
     use serde::{Serialize, de::DeserializeOwned};
     use serde_json::json;
-    use std::collections::HashMap;
-    use std::sync::Arc;
     use tera::Tera;
     use tokio::sync::RwLock;
     use tower::ServiceExt;
     use uuid::Uuid;
+
+    use super::*;
+    use crate::{AppState, ConnectionMap, db::Db, producer::MockProducer};
 
     // --- MOCK DEFINITIONS ---
     mock! {
@@ -575,7 +588,39 @@ mod tests {
         // Assert
         assert_eq!(response.status(), StatusCode::OK);
     }
+    #[tokio::test]
+    async fn test_dashboard_without_cookie_redirects() {
+        let mock_db = MockDb::new();
+        // Expect no DB calls since the handler should redirect immediately if cookie is missing
 
+        let state = create_test_state(mock_db, MockProducer::new());
+        let app = Router::new()
+            .route("/dashboard", get(dashboard))
+            .with_state(state);
+
+        let req = build_get_request("/dashboard");
+        let response = app.oneshot(req).await.unwrap();
+
+        assert!(
+            response.status().is_redirection(),
+            "Expected redirection (3xx) when accessing dashboard without cookie, but got status: {}",
+            response.status()
+        );
+
+        let location = response
+            .headers()
+            .get(http::header::LOCATION)
+            .expect("Missing Location header")
+            .to_str()
+            .expect("Invalid Location header value");
+
+        // Accepts redirect to root (login) or logout endpoint
+        assert!(
+            location == "/" || location == "/logout",
+            "Expected redirect to '/' or '/logout', got: {}",
+            location
+        );
+    }
     // --- HELPER FUNCTIONS ---
 
     fn new_uuid() -> Uuid {

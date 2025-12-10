@@ -1,12 +1,14 @@
-use std::sync::Arc;
-
-use tokio_stream::StreamExt;
-
 use anyhow::{Context, Result};
+use metrics::{counter, gauge, histogram};
 use rdkafka::{
-    ClientConfig, Message,
+    ClientConfig, Message, Offset,
     consumer::{Consumer, StreamConsumer},
 };
+use std::sync::Arc;
+use std::time::Instant;
+use tokio::time::{Duration, interval};
+use tokio_stream::StreamExt;
+use tracing::Instrument;
 
 use crate::{
     ConnectionMap,
@@ -14,9 +16,9 @@ use crate::{
 };
 
 pub struct MessageConsumer {
-    consumer: StreamConsumer,
+    consumer: Arc<StreamConsumer>,
+    consumer_topic: String,
 }
-// FIXME : Make sure the id of message is converted to a TimeuiD
 
 impl MessageConsumer {
     pub fn new(broker: &str, topic: &str, group_id: &str) -> Result<MessageConsumer> {
@@ -29,9 +31,59 @@ impl MessageConsumer {
         consumer
             .subscribe(&[topic])
             .context("Consumer failed to subscribe to topic")?;
-        Ok(MessageConsumer { consumer })
+
+        Ok(MessageConsumer {
+            consumer: Arc::new(consumer),
+            consumer_topic: topic.to_string(),
+        })
     }
-    /// ScyllaDB and Websocket
+
+    /// Compute how meany messages are waiting to be processed by the redpanda consumer
+    pub fn spawn_lag_monitor(&self) {
+        let consumer = self.consumer.clone();
+        let topic = self.consumer_topic.clone();
+
+        tokio::spawn(async move {
+            let mut interval = interval(Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+
+                // 1. Fetch Metadata to discover all partitions
+                let metadata = match consumer.fetch_metadata(Some(&topic), Duration::from_secs(5)) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::warn!("Failed to fetch metadata: {:?}", e);
+                        continue;
+                    }
+                };
+
+                let mut total_lag: i64 = 0;
+
+                // 2. Iterate over every partition found
+                if let Some(topic_metadata) = metadata.topics().first() {
+                    for partition in topic_metadata.partitions() {
+                        let pid = partition.id();
+
+                        if let Ok((_low, high)) =
+                            consumer.fetch_watermarks(&topic, pid, Duration::from_secs(5))
+                            && let Ok(topic_partitions) = consumer.position()
+                            && let Some(elem) = topic_partitions
+                                .elements()
+                                .iter()
+                                .find(|e| e.partition() == pid)
+                            && let Offset::Offset(current_offset) = elem.offset()
+                        {
+                            let partition_lag = high - current_offset;
+                            total_lag += partition_lag;
+                        }
+                    }
+                }
+
+                gauge!("consumer_lag").set(total_lag as f64);
+            }
+        });
+    }
+
     pub async fn consume_messages(
         &self,
         db: Arc<ScyllaDb>,
@@ -44,26 +96,53 @@ impl MessageConsumer {
 
             let payload = message
                 .payload_view::<str>()
-                .context("Failed to get message payload view")?
-                .context("Error while deserializing message payload")?;
+                .context("no payload")?
+                .context("invalid utf8")?;
+            let start_total = Instant::now();
+            let parent_span =
+                tracing::info_span!("process_message", raw_message_size = payload.len());
+            let _enter = parent_span.enter();
 
-            let chat_message = serde_json::from_str::<crate::schema::PandaMessage>(payload)
-                .context("Error while deserializing message payload")?;
+            let chat_message = {
+                let _span = tracing::info_span!("deserialize").entered();
+                serde_json::from_str::<crate::schema::PandaMessage>(payload)?
+            };
+
+            counter!("consumer_messages_processed_total").increment(1);
 
             let chat_id = chat_message.chat_id;
-            // 1. Insert messages to database
+
+            // --- MEASUREMENT 1: Database Insert ---
+            let start_db = Instant::now();
+
             db.insert_message(chat_message.clone())
                 .await
                 .context("Failed to insert message into DB")?;
 
-            // 2. Send the message to all the user_id in the chat
-            let members = db.get_members_of_chat(chat_id).await?;
-            // FIXME : This looks like a very naive implementation
-            for (user_id, sender) in connections.read().await.iter() {
-                if members.contains(user_id) {
-                    sender.send(chat_message.clone()).await?;
+            histogram!("consumer_db_duration_seconds").record(start_db.elapsed().as_secs_f64());
+
+            // --- MEASUREMENT 2: Broadcasting ---
+            let start_broadcast = Instant::now();
+
+            async {
+                let members = db.get_members_of_chat(chat_id).await?;
+                for (user_id, sender) in connections.read().await.iter() {
+                    if members.contains(user_id) {
+                        // If the buffer is full do not broadcast the message
+                        let _ = sender.try_send(chat_message.clone());
+                    }
                 }
+                Ok::<(), anyhow::Error>(())
             }
+            .instrument(tracing::info_span!("broadcast_logic"))
+            .await?;
+
+            histogram!("consumer_broadcast_duration_seconds")
+                .record(start_broadcast.elapsed().as_secs_f64());
+
+            // --- MEASUREMENT 3: Total Loop ---
+            histogram!("consumer_processing_duration_seconds")
+                .record(start_total.elapsed().as_secs_f64());
         }
         Ok(())
     }
