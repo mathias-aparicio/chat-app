@@ -31,6 +31,7 @@ axum-extra = { version = "0.12.2", features = [
   "typed-header",
 ] }
 futures-util = "0.3.31"
+dashmap = "6.1.0"
 tokio-util = "0.7.17"
 console-subscriber = "0.5.0"
 opentelemetry = "0.31.0"

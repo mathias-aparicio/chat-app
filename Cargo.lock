@@ -333,6 +333,7 @@ dependencies = [
  "axum-prometheus",
  "chrono",
  "console-subscriber",
+ "dashmap",
  "futures-util",
  "metrics",
  "metrics-exporter-prometheus 0.18.1",

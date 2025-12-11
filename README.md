@@ -1,5 +1,7 @@
 # A distributed redpanda scylladb chat app
 
+This program is a distributed chat-app using redpanda to consume message to be sent over websocket and inserted in the nosql database ScyllaDb.
+
 To run the app run (add `--build` if the Rust code has changed):
 
 ```bash
@@ -45,7 +47,7 @@ To vizualize the stress test we have 3 pannels
 ### Processing Breakdown (Latency)
 
 - DB Insert Latency : Time spent inserting a message in the database (s)
-- Broadcast Latency : Time spent, getting the users recipient of the message and sending the message on a tokio channel for websocket to use (s)
+- Broadcast Latency : Time spent fetching chat members and dispatching the message to connected users (s)
 - Total Loop Latency : Full time spent inside the processing message loop (s)
 
 ![Processing Breakdown](static/img/0-breakdown.png)
@@ -99,7 +101,7 @@ pub async fn consume_messages(
     connections: ConnectionMap,
 ) -> Result<()> {
     let stream = self.consumer.stream();
-    stream.for_each_concurrent(Some(100), |message_result| {
+    stream.for_each_concurrent(100, |message_result| {
         async move {
       // Concurrent task
     }).await;
@@ -110,13 +112,63 @@ pub async fn consume_messages(
 
 ![Work time of 100 now](static/img/1-work-time.png)
 
-Work time per second goes nearly 100 
+Work time per second goes nearly 100
 
 And while the latency went up from 0.6ms to 16ms (because we batch 100 of insert a time instead of one)
 The throughput increased 3 times (2k -> 6k) !
-![latency-troughput](static/img/1-work-time.png)
+
+![latency-troughput](static/img/1-latency-troughput.png)
+
 > [!NOTE]
-> We actually verified Littl's law 6 000 * 16 * 10^(-3) = 96 ≈ 100 
+> We actually verified Littl's law 6 000 _16_ 10^(-3) = 96 ≈ 100
+
+### Chat members lookup
+
+```rust
+      let members = db.get_members_of_chat(chat_id).await?;
+    // Lock the connection map with RwLock for each connections in the chat
+      for (user_id, sender) in connections.read().await.iter() {// Do stuff}
+```
+
+to
+
+```rust
+  let members = db.get_members_of_chat(chat_id).await?;
+  let lock = connections.read().await; // Lock the map only once
+```
+
+With 11 users total it does not change much but with thousands it would.
+
+However for each message we call `get_members_of_chat` this could be cached.
+
+Our API do not provide a way to change the list members of a chatroom after creation, but we will act as if. So we will implement a short TTL of one second. Which means that a user would have receive his message instantly and on the worst case scenario uppon adding he would wait 1 second. We could have lowered that even more and improve performance by using kafka event.
+
+We use a dashmap to safely acess chat_id -> members datastruct
+
+```rust
+async {
+        if timestamp.elapsed() < CACHE_TTL {
+            members_to_use = Some(members.clone());  }
+    }
+    // If we go in this then members_to_use is still None
+    // If the cache expired or missed
+    if members_to_use.is_none() {
+        let members = db.get_members_of_chat(chat_id).await?;
+        members_cache.insert(chat_id, (members.clone(), Instant::now()));
+        members_to_use = Some(members);}
+
+    if let Some(members) = members_to_use {// DO STUF}
+
+```
+
+![troughput-latency](static/img/2-troughput-latency.png)
+
+The implemented cache lookup mecanism do remove the broadcast latency and improve by 3 000 processed messages per second !
+
+### Insert message latency
+
+Finally we want to optimise the insert message latency. For this we will use ScyllaDb batch method, to apply an list of insert instead of inserting one by one.
+
 ## Run the test
 
 ```bash

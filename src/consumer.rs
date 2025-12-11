@@ -1,5 +1,6 @@
 use crate::db::Db;
 use anyhow::{Context, Result};
+use dashmap::DashMap;
 use futures_util::StreamExt;
 use metrics::{counter, gauge, histogram};
 use rdkafka::Message;
@@ -11,6 +12,7 @@ use std::sync::Arc;
 use tokio::time::Instant;
 use tokio::time::{Duration, interval};
 use tracing::Instrument;
+use uuid::Uuid;
 
 use crate::{ConnectionMap, db::ScyllaDb};
 
@@ -88,11 +90,15 @@ impl MessageConsumer {
         db: Arc<ScyllaDb>,
         connections: ConnectionMap,
     ) -> Result<()> {
-        let mut stream = self.consumer.stream();
+        let stream = self.consumer.stream();
+        let members_cache: Arc<DashMap<Uuid, (Vec<Uuid>, Instant)>> = Arc::new(DashMap::new());
+        const CACHE_TTL: Duration = Duration::from_secs(1);
+
         stream
             .for_each_concurrent(100, |message_result| {
                 let db = db.clone();
                 let connections = connections.clone();
+                let members_cache = members_cache.clone();
                 async move {
                     let result = async {
                         let message = message_result.context("Kafka consumer error")?;
@@ -127,14 +133,34 @@ impl MessageConsumer {
                             .record(start_db.elapsed().as_secs_f64());
 
                         // --- MEASUREMENT 2: Broadcasting ---
+
                         let start_broadcast = Instant::now();
+                        let mut members_to_use = None;
 
                         async {
-                            let members = db.get_members_of_chat(chat_id).await?;
-                            for (user_id, sender) in connections.read().await.iter() {
-                                if members.contains(user_id) {
-                                    // If the buffer is full do not broadcast the message
-                                    let _ = sender.try_send(chat_message.clone());
+                            if let Some(entry) = members_cache.get(&chat_id) {
+                                let (members, timestamp) = entry.value();
+                                // If cache is used bellow TTL we use its value
+                                if timestamp.elapsed() < CACHE_TTL {
+                                    members_to_use = Some(members.clone());
+                                }
+                            }
+
+                            // If we go in this then members_to_use is still None
+                            // If the cache expired or missed
+                            if members_to_use.is_none() {
+                                let members = db.get_members_of_chat(chat_id).await?;
+                                members_cache.insert(chat_id, (members.clone(), Instant::now()));
+                                members_to_use = Some(members);
+                            }
+
+                            if let Some(members) = members_to_use {
+                                let lock = connections.read().await;
+                                for member_id in members {
+                                    if let Some(sender) = lock.get(&member_id) {
+                                        // Ignore send errors
+                                        let _ = sender.try_send(chat_message.clone());
+                                    }
                                 }
                             }
                             Ok::<(), anyhow::Error>(())
