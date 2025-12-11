@@ -1,74 +1,64 @@
-# A distributed redpanda scylladb chat app
+# High Performance Distributed Chat Application
 
-This program is a distributed chat-app using redpanda to consume message to be sent over websocket and inserted in the nosql database ScyllaDb.
+A scalable backend built with Rust, Redpanda, and ScyllaDB. This project demonstrates high-throughput message processing, asynchronous concurrency, and database optimization techniques.
+
+## Architecture
+
+1. **Ingestion:** Messages are received via HTTP and published to a Redpanda topic.
+2. **Processing:** A background consumer processes messages, batches them, and inserts them into ScyllaDB.
+3. **Delivery:** Messages are pushed to connected users via WebSocket.
 
 To run the app run (add `--build` if the Rust code has changed):
+
+#### Running the application
 
 ```bash
 docker compose up -d
 ```
 
+### Flow of sending a message
+
 1. Alice sends "hi" to Bob
 
 - Make a `POST` request to `/chats/{chatId}/messages`
-- Publish message to a RedPanda topic
+- Publish message to a Redpanda topic
 - Do not save in the database yet
 
-2. Background process watches the messages topic
+2. Background process, the consumer
 
+- Watches the message topic
 - Save to database
 - Send to Bob's Websocket if he is connected
 
 3. Message reception
 
-- If Bob is online
-  - Push the message to Bob's Websocket
-- If Bob is offline
-  - It is simply stored in the database
-- Upon Bob connection his client will establish a connection via `/ws/connect/{userId}` and `GET` `/chats/{chatID}/messages` to fetch the conversation.
+- Bob is online: Message is pushed immediately to the WebSocket.
+- Bob is offline: Message is stored in the DB, and upon reconnection the client will fetch the history of unread message.
 
-## Evaluating the app performance
+## Performance evaluation and Optimization
 
-To vizualize the stress test we have 3 pannels
+To visualize the stress test we have 3 panels.
 
-### Throughput Rate
+We impose the backend a load test using [K6](https://k6.io/). The test simulate 10 users spamming message in a single chatroom, starting at 1,000 msg/s and ramping up to 10,000 msg/s.
 
-- Input : Number of messages posted (HTTP req/s)
-- Output : Number of message consumed by the redpanda topic (msg/s)
+### Metrics visualized
+
+- **Throughput Rate:** Input (HTTP req/s) vs. Output (Redpanda consumed msg/s).
+- **Concurrency Level:** Number of messages waiting in the topic queue not yet consumed.
+- **Latency Breakdown:** DB Insertion, Broadcast, and Total Loop Latency
+
+### Sequential Processing
+
+At 1,050 msg/s, the Input rate goes above the Output rate. We observed consequent consumer lag, with an all-time high of **437,000 messages** waiting to be consumed in the Redpanda topic.
 
 ![Throughput Rates](static/img/0-throughput.png)
-
-### Lag
-
-- Pending messages : Number of messages waiting to be processed inside the topic (msg/s)
-
 ![Consumer Lag](static/img/0-lag.png)
 
-### Processing Breakdown (Latency)
+#### The cause
 
-- DB Insert Latency : Time spent inserting a message in the database (s)
-- Broadcast Latency : Time spent fetching chat members and dispatching the message to connected users (s)
-- Total Loop Latency : Full time spent inside the processing message loop (s)
+The consumer implementation was sequential: It fetched a message, processed it (store, broadcast) and only then fetch another one. We can see this with a Concurrency Level of less than one.
 
-![Processing Breakdown](static/img/0-breakdown.png)
-We have submitted the backend to a load test using [K6](https://k6.io/). The test is very simple, it creates ten users that spam messages on a single chatroom.
-
-The test start with 1 000 msg/s and goes up to 10 000 msg/s.
-
-At 1050 msg/s the Input goes above the Output. We see up to 437 000 messages waiting to be processed inside the topic. In the lag pannel.
-
-### Sequence vs parallel
-
-This pannel show how "second of work" are done during one second in the consumer pannel. We see that it is always inferior to one.
-
-![Work time ](static/img/0-work-time.png)
-
-The density of work is less than one because the consumer code is sequential :
-
-1. Get a message of the stream
-2. Handle it
-
-Before the message has been handled no other messages can be processed. Only one consumer
+![Concurrency Level](static/img/0-work-time.png)
 
 ```rust
     pub async fn consume_messages(
@@ -76,23 +66,24 @@ Before the message has been handled no other messages can be processed. Only one
         connections: ConnectionMap,
     ) -> Result<()> {
         let mut stream = self.consumer.stream();
-      // This implementation is one stream after the other
+      // One message after the other
         while let Some(message_result) = stream.next().await {
-        // Rest of the code
-      }
+            // Rest of the code
+        }
         Ok(())
     }
 }
-
 ```
 
-With multiple parallel consumer, we can actually compute the ideal limit with [Little's law](https://en.wikipedia.org/wiki/Little%27s_law)
-Where the limit L is proportional to the message per second input lambda and the latency of consuming a message W.
+### Parallel Consumers
 
-L = lambda x W
-which gives for lambda = 0.01 (db insert) + o(0.10) (broadcast is negligible)
-and W = 10 000 message/s
-L = 100
+To remove this bottleneck, we spanned multiple thread to work concurrently on the consume task.
+The ideal number can be estimated with [Little's Law](https://en.wikipedia.org/wiki/Little%27s_law) : `L = lambda x W`
+
+- Target Throughput (lambda) = 10, 000 msg/s
+- Processing Latency (W) = 0.01 s (DB INSERT)
+
+So L, ideal number of consumer, is 100
 
 ```rust
 pub async fn consume_messages(
@@ -103,82 +94,75 @@ pub async fn consume_messages(
     let stream = self.consumer.stream();
     stream.for_each_concurrent(100, |message_result| {
         async move {
-      // Concurrent task
+            // Concurrent task
+        }
     }).await;
 
     Ok(())
 }
 ```
 
-![Work time of 100 now](static/img/1-work-time.png)
+### Result
 
-Work time per second goes nearly 100
+- Throughput tripled (2k to 6k msg/s)
+- Concurrency Level around 100
+  > [!NOTE]
+  > We actually verified Little's Law: 6,000 _16_ 10^(-3) = 96 ≈ 100
+<p align="center">
+<img src="static/img/1-work-time.png" alt="Improved Concurrency" />
 
-And while the latency went up from 0.6ms to 16ms (because we batch 100 of insert a time instead of one)
-The throughput increased 3 times (2k -> 6k) !
+</p>
 
-![latency-troughput](static/img/1-latency-troughput.png)
+### Caching and Lock Contention
 
-> [!NOTE]
-> We actually verified Littl's law 6 000 _16_ 10^(-3) = 96 ≈ 100
+Broadcast latency is still high comparable to the inserting latency. Broadcasting to websocket should be negligible against DB operation.
+This is because for each message there is a database lookup to get the connected members of the group chat.
 
-### Chat members lookup
+![Latency](static/img/1-breakdown.png)
 
-```rust
-      let members = db.get_members_of_chat(chat_id).await?;
-    // Lock the connection map with RwLock for each connections in the chat
-      for (user_id, sender) in connections.read().await.iter() {// Do stuff}
-```
-
-to
+Original approach:
 
 ```rust
-  let members = db.get_members_of_chat(chat_id).await?;
-  let lock = connections.read().await; // Lock the map only once
+    // For each message a DB lookup to check connected members
+    let members = db.get_members_of_chat(chat_id).await?;
+    // Lock the connection map with RwLock for each connection in the chat
+    for (user_id, sender) in connections.read().await.iter() {}
 ```
 
-With 11 users total it does not change much but with thousands it would.
+Optimized approach :
 
-However for each message we call `get_members_of_chat` this could be cached.
-
-Our API do not provide a way to change the list members of a chatroom after creation, but we will act as if. So we will implement a short TTL of one second. Which means that a user would have receive his message instantly and on the worst case scenario uppon adding he would wait 1 second. We could have lowered that even more and improve performance by using kafka event.
-
-We use a dashmap to safely acess chat_id -> members datastruct
+- Get the lock only once, and then look for users
+- Cache the members list of groupchat with a TTL avoiding hitting the DB for every messages.
 
 ```rust
-async {
-        if timestamp.elapsed() < CACHE_TTL {
-            members_to_use = Some(members.clone());  }
-    }
-    // If we go in this then members_to_use is still None
-    // If the cache expired or missed
-    if members_to_use.is_none() {
-        let members = db.get_members_of_chat(chat_id).await?;
-        members_cache.insert(chat_id, (members.clone(), Instant::now()));
-        members_to_use = Some(members);}
-
-    if let Some(members) = members_to_use {// DO STUF}
-
+if let Some(members) = members_cache.get(&chat_id) {
+    // Use cached members
+} else {
+    // Fetch from DB and update cache
+    let members = db.get_members_of_chat(chat_id).await?;
+    members_cache.insert(chat_id, (members, Instant::now()));
+}
+let lock = connections.read().await; // Lock once
 ```
 
-![troughput-latency](static/img/2-troughput-latency.png)
+#### Result
 
-The implemented cache lookup mechanism do remove the broadcast latency and improve by 3 000 processed messages per second !
+This removed the broadcast latency bottleneck and improved throughput by another 3,000 msg/s.
+![Throughput Latency](static/img/2-troughput-latency.png)
 
-### Insert message latency
+### Batch Inserts
 
-Finally we want to optimise the insert message latency.
-We will batch the message INSERT. We need two things :
-Implement an `insert_batch_message` for the database and change from `for_each_concurrent` to `chunks_timeout` which batches items in the stream after a certain amount of message or duration is met.
+To finally reach 10,000 msg/s target we had to optimized the database writes.
 
-This make the input and output line overlap and divide by ten overall latency. 
-![alt text](image-1.png)
-We have sucesfully handled 10 000 message / s. 
+Instead of inserting messages one by one we used `chunks_tmeout` to divide the Redpanda stream onto group of messages that can be inserted all at once.
 
-This is so optimised that I couldn't run a k6 test that create enough http request to see the yellow curved go above the green (it caped at 26 kmessage/s)
+We have successfully handled 10,000 message/s.
 
+![Final Performance](static/img/3-final.png)
 
-## Run the test
+We optimized the system so effectively that the k6 load generator capped before the backend **26,000 msg/s** (Output and Input overlapping).
+
+## Run the Stress Test
 
 ```bash
 docker run --rm -i \
