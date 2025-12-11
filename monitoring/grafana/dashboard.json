@@ -106,6 +106,38 @@
          ],
          "title": "Processing Breakdown (Latency)",
          "type": "timeseries"
+      },
+      {
+         "datasource": {
+            "type": "datasource",
+            "uid": "-- Mixed --"
+         },
+         "fieldConfig": {
+            "defaults": {
+               "min": 0,
+               "unit": "none"
+            }
+         },
+         "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 16
+         },
+         "id": 4,
+         "pluginVersion": "v11.4.0",
+         "targets": [
+            {
+               "datasource": {
+                  "type": "prometheus",
+                  "uid": "prometheus_ds"
+               },
+               "expr": "sum(rate(consumer_processing_duration_seconds_sum[1m]))",
+               "legendFormat": "Concurrency Level"
+            }
+         ],
+         "title": "How meany work time per second",
+         "type": "timeseries"
       }
    ],
    "schemaVersion": 39,

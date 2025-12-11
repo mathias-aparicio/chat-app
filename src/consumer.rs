@@ -1,19 +1,18 @@
+use crate::db::Db;
 use anyhow::{Context, Result};
+use futures_util::StreamExt;
 use metrics::{counter, gauge, histogram};
+use rdkafka::Message;
 use rdkafka::{
-    ClientConfig, Message, Offset,
+    ClientConfig, Offset,
     consumer::{Consumer, StreamConsumer},
 };
 use std::sync::Arc;
-use std::time::Instant;
+use tokio::time::Instant;
 use tokio::time::{Duration, interval};
-use tokio_stream::StreamExt;
 use tracing::Instrument;
 
-use crate::{
-    ConnectionMap,
-    db::{Db, ScyllaDb},
-};
+use crate::{ConnectionMap, db::ScyllaDb};
 
 pub struct MessageConsumer {
     consumer: Arc<StreamConsumer>,
@@ -90,60 +89,76 @@ impl MessageConsumer {
         connections: ConnectionMap,
     ) -> Result<()> {
         let mut stream = self.consumer.stream();
+        stream
+            .for_each_concurrent(100, |message_result| {
+                let db = db.clone();
+                let connections = connections.clone();
+                async move {
+                    let result = async {
+                        let message = message_result.context("Kafka consumer error")?;
+                        let payload = message
+                            .payload_view::<str>()
+                            .context("no payload")?
+                            .context("invalid utf8")?;
+                        let start_total = Instant::now();
+                        let parent_span = tracing::info_span!(
+                            "process_message",
+                            raw_message_size = payload.len()
+                        );
+                        let _enter = parent_span.enter();
 
-        while let Some(message_result) = stream.next().await {
-            let message = message_result.context("Kafka consumer error")?;
+                        let chat_message = {
+                            let _span = tracing::info_span!("deserialize").entered();
+                            serde_json::from_str::<crate::schema::PandaMessage>(payload)?
+                        };
 
-            let payload = message
-                .payload_view::<str>()
-                .context("no payload")?
-                .context("invalid utf8")?;
-            let start_total = Instant::now();
-            let parent_span =
-                tracing::info_span!("process_message", raw_message_size = payload.len());
-            let _enter = parent_span.enter();
+                        counter!("consumer_messages_processed_total").increment(1);
 
-            let chat_message = {
-                let _span = tracing::info_span!("deserialize").entered();
-                serde_json::from_str::<crate::schema::PandaMessage>(payload)?
-            };
+                        let chat_id = chat_message.chat_id;
 
-            counter!("consumer_messages_processed_total").increment(1);
+                        // --- MEASUREMENT 1: Database Insert ---
+                        let start_db = Instant::now();
 
-            let chat_id = chat_message.chat_id;
+                        db.insert_message(chat_message.clone())
+                            .await
+                            .context("Failed to insert message into DB")?;
 
-            // --- MEASUREMENT 1: Database Insert ---
-            let start_db = Instant::now();
+                        histogram!("consumer_db_duration_seconds")
+                            .record(start_db.elapsed().as_secs_f64());
 
-            db.insert_message(chat_message.clone())
-                .await
-                .context("Failed to insert message into DB")?;
+                        // --- MEASUREMENT 2: Broadcasting ---
+                        let start_broadcast = Instant::now();
 
-            histogram!("consumer_db_duration_seconds").record(start_db.elapsed().as_secs_f64());
+                        async {
+                            let members = db.get_members_of_chat(chat_id).await?;
+                            for (user_id, sender) in connections.read().await.iter() {
+                                if members.contains(user_id) {
+                                    // If the buffer is full do not broadcast the message
+                                    let _ = sender.try_send(chat_message.clone());
+                                }
+                            }
+                            Ok::<(), anyhow::Error>(())
+                        }
+                        .instrument(tracing::info_span!("broadcast_logic"))
+                        .await?;
 
-            // --- MEASUREMENT 2: Broadcasting ---
-            let start_broadcast = Instant::now();
+                        histogram!("consumer_broadcast_duration_seconds")
+                            .record(start_broadcast.elapsed().as_secs_f64());
 
-            async {
-                let members = db.get_members_of_chat(chat_id).await?;
-                for (user_id, sender) in connections.read().await.iter() {
-                    if members.contains(user_id) {
-                        // If the buffer is full do not broadcast the message
-                        let _ = sender.try_send(chat_message.clone());
+                        // --- MEASUREMENT 3: Total Loop ---
+                        histogram!("consumer_processing_duration_seconds")
+                            .record(start_total.elapsed().as_secs_f64());
+                        Ok::<(), anyhow::Error>(())
+                    }
+                    .await;
+
+                    // Handle the error (log it) so the stream returns () and keeps going
+                    if let Err(e) = result {
+                        tracing::error!("Error processing message: {:?}", e);
                     }
                 }
-                Ok::<(), anyhow::Error>(())
-            }
-            .instrument(tracing::info_span!("broadcast_logic"))
-            .await?;
-
-            histogram!("consumer_broadcast_duration_seconds")
-                .record(start_broadcast.elapsed().as_secs_f64());
-
-            // --- MEASUREMENT 3: Total Loop ---
-            histogram!("consumer_processing_duration_seconds")
-                .record(start_total.elapsed().as_secs_f64());
-        }
+            })
+            .await;
         Ok(())
     }
 }

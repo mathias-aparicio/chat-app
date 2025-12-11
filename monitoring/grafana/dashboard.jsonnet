@@ -46,4 +46,15 @@ dashboard.new('Chat App - Performance Analysis')
   ])
   + timeSeries.standardOptions.withUnit('s')
   + timeSeries.panelOptions.withGridPos(h=8, w=24, x=0, y=8),
+
+  // Panel 4: Concurrency Factor
+  timeSeries.new('How meany work time per second')
+  + timeSeries.queryOptions.withTargets([
+    query.new(ds, 'sum(rate(consumer_processing_duration_seconds_sum[1m]))')
+    + query.withLegendFormat('Concurrency Level'),
+  ])
+  + timeSeries.standardOptions.withUnit('none')
+  + timeSeries.standardOptions.withMin(0)
+
+  + timeSeries.panelOptions.withGridPos(h=8, w=12, x=0, y=16),
 ])
