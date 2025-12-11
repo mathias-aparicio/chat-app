@@ -24,7 +24,7 @@ async-trait = "0.1.89"
 serde_json = "1.0.145"
 rdkafka = "0.38.0"
 tera = "1.20.1"
-tokio-stream = "0.1.17"
+tokio-stream = { version = "0.1.17", features = ["time"] }
 axum-extra = { version = "0.12.2", features = [
   "cookie",
   "form",

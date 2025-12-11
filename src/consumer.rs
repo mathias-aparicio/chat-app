@@ -11,6 +11,7 @@ use rdkafka::{
 use std::sync::Arc;
 use tokio::time::Instant;
 use tokio::time::{Duration, interval};
+use tokio_stream::StreamExt as _;
 use tracing::Instrument;
 use uuid::Uuid;
 
@@ -93,80 +94,99 @@ impl MessageConsumer {
         let stream = self.consumer.stream();
         let members_cache: Arc<DashMap<Uuid, (Vec<Uuid>, Instant)>> = Arc::new(DashMap::new());
         const CACHE_TTL: Duration = Duration::from_secs(1);
+        const POOL_NUMBER: usize = 20;
 
-        stream
-            .for_each_concurrent(100, |message_result| {
+        let chunked_stream = stream.chunks_timeout(50, Duration::from_millis(50));
+
+        chunked_stream
+            .for_each_concurrent(POOL_NUMBER, |chunk| {
                 let db = db.clone();
                 let connections = connections.clone();
                 let members_cache = members_cache.clone();
+
                 async move {
+                    let start_total = Instant::now();
+                    let mut valid_messages = Vec::with_capacity(chunk.len());
+
+                    for message_result in chunk {
+                        let processed = (|| {
+                            let message = message_result.context("Kafka consumer error")?;
+                            let payload = message
+                                .payload_view::<str>()
+                                .context("no payload")?
+                                .context("invalid utf8")?;
+
+                            let parent_span = tracing::info_span!(
+                                "process_message",
+                                raw_message_size = payload.len()
+                            );
+                            let _ = parent_span.enter();
+
+                            let chat_message = {
+                                let _ = tracing::info_span!("deserialize").entered();
+                                serde_json::from_str::<crate::schema::PandaMessage>(payload)?
+                            };
+                            Ok::<_, anyhow::Error>(chat_message)
+                        })();
+
+                        match processed {
+                            Ok(msg) => valid_messages.push(msg),
+                            Err(e) => tracing::error!("Skipping invalid message: {:?}", e),
+                        }
+                    }
+
+                    if valid_messages.is_empty() {
+                        return;
+                    }
+
                     let result = async {
-                        let message = message_result.context("Kafka consumer error")?;
-                        let payload = message
-                            .payload_view::<str>()
-                            .context("no payload")?
-                            .context("invalid utf8")?;
-                        let start_total = Instant::now();
-                        let parent_span = tracing::info_span!(
-                            "process_message",
-                            raw_message_size = payload.len()
-                        );
-                        let _enter = parent_span.enter();
+                        counter!("consumer_messages_processed_total")
+                            .increment(valid_messages.len() as u64);
 
-                        let chat_message = {
-                            let _span = tracing::info_span!("deserialize").entered();
-                            serde_json::from_str::<crate::schema::PandaMessage>(payload)?
-                        };
-
-                        counter!("consumer_messages_processed_total").increment(1);
-
-                        let chat_id = chat_message.chat_id;
-
-                        // --- MEASUREMENT 1: Database Insert ---
+                        // --- MEASUREMENT 1: Database Insert (Batch) ---
                         let start_db = Instant::now();
 
-                        db.insert_message(chat_message.clone())
+                        db.insert_batch_message(&valid_messages)
                             .await
-                            .context("Failed to insert message into DB")?;
+                            .context("Failed to insert message batch into DB")?;
 
                         histogram!("consumer_db_duration_seconds")
                             .record(start_db.elapsed().as_secs_f64());
 
                         // --- MEASUREMENT 2: Broadcasting ---
-
                         let start_broadcast = Instant::now();
-                        let mut members_to_use = None;
+                        for chat_message in valid_messages {
+                            let chat_id = chat_message.chat_id;
+                            let mut members_to_use = None;
 
-                        async {
-                            if let Some(entry) = members_cache.get(&chat_id) {
-                                let (members, timestamp) = entry.value();
-                                // If cache is used bellow TTL we use its value
-                                if timestamp.elapsed() < CACHE_TTL {
-                                    members_to_use = Some(members.clone());
-                                }
-                            }
-
-                            // If we go in this then members_to_use is still None
-                            // If the cache expired or missed
-                            if members_to_use.is_none() {
-                                let members = db.get_members_of_chat(chat_id).await?;
-                                members_cache.insert(chat_id, (members.clone(), Instant::now()));
-                                members_to_use = Some(members);
-                            }
-
-                            if let Some(members) = members_to_use {
-                                let lock = connections.read().await;
-                                for member_id in members {
-                                    if let Some(sender) = lock.get(&member_id) {
-                                        // Ignore send errors
-                                        let _ = sender.try_send(chat_message.clone());
+                            async {
+                                if let Some(entry) = members_cache.get(&chat_id) {
+                                    let (members, timestamp) = entry.value();
+                                    if timestamp.elapsed() < CACHE_TTL {
+                                        members_to_use = Some(members.clone());
                                     }
                                 }
+
+                                if members_to_use.is_none() {
+                                    let members = db.get_members_of_chat(chat_id).await?;
+                                    members_cache
+                                        .insert(chat_id, (members.clone(), Instant::now()));
+                                    members_to_use = Some(members);
+                                }
+
+                                if let Some(members) = members_to_use {
+                                    let lock = connections.read().await;
+                                    for member_id in members {
+                                        if let Some(sender) = lock.get(&member_id) {
+                                            let _ = sender.try_send(chat_message.clone());
+                                        }
+                                    }
+                                }
+                                Ok::<(), anyhow::Error>(())
                             }
-                            Ok::<(), anyhow::Error>(())
+                            .instrument(tracing::info_span!("broadcast_logic"))
+                            .await?;
                         }
-                        .instrument(tracing::info_span!("broadcast_logic"))
-                        .await?;
 
                         histogram!("consumer_broadcast_duration_seconds")
                             .record(start_broadcast.elapsed().as_secs_f64());
@@ -178,9 +198,8 @@ impl MessageConsumer {
                     }
                     .await;
 
-                    // Handle the error (log it) so the stream returns () and keeps going
                     if let Err(e) = result {
-                        tracing::error!("Error processing message: {:?}", e);
+                        tracing::error!("Error processing batch: {:?}", e);
                     }
                 }
             })

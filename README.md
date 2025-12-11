@@ -163,11 +163,20 @@ async {
 
 ![troughput-latency](static/img/2-troughput-latency.png)
 
-The implemented cache lookup mecanism do remove the broadcast latency and improve by 3 000 processed messages per second !
+The implemented cache lookup mechanism do remove the broadcast latency and improve by 3 000 processed messages per second !
 
 ### Insert message latency
 
-Finally we want to optimise the insert message latency. For this we will use ScyllaDb batch method, to apply an list of insert instead of inserting one by one.
+Finally we want to optimise the insert message latency.
+We will batch the message INSERT. We need two things :
+Implement an `insert_batch_message` for the database and change from `for_each_concurrent` to `chunks_timeout` which batches items in the stream after a certain amount of message or duration is met.
+
+This make the input and output line overlap and divide by ten overall latency. 
+![alt text](image-1.png)
+We have sucesfully handled 10 000 message / s. 
+
+This is so optimised that I couldn't run a k6 test that create enough http request to see the yellow curved go above the green (it caped at 26 kmessage/s)
+
 
 ## Run the test
 

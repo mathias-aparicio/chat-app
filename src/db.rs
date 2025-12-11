@@ -5,6 +5,7 @@ use scylla::{
     client::{session::Session, session_builder::SessionBuilder},
     deserialize::row::DeserializeRow as DeserializeRowTrait,
     serialize::row::SerializeRow,
+    statement::batch::Batch,
     value::CqlTimeuuid,
 };
 use uuid::Uuid;
@@ -16,6 +17,7 @@ use crate::{
 
 #[async_trait]
 pub trait Db: Send + Sync {
+    async fn insert_batch_message(&self, messages: &[PandaMessage]) -> Result<()>;
     async fn insert_message(&self, message: PandaMessage) -> Result<PandaMessage>;
     async fn create_user(&self, username: &str) -> Result<User>;
     async fn create_chat(&self, name: &str, members: &[Uuid]) -> Result<Chat>;
@@ -68,6 +70,24 @@ impl ScyllaDb {
 
 #[async_trait]
 impl Db for ScyllaDb {
+    async fn insert_batch_message(&self, messages: &[PandaMessage]) -> Result<()> {
+        let mut batch: Batch = Default::default();
+        let mut batch_values = Vec::new();
+        for msg in messages {
+            batch.append_statement(
+            "INSERT INTO ks.messages (message_id, chat_id, sender_id, content) VALUES (?, ?, ?, ?)",
+        );
+            batch_values.push((
+                scylla::value::CqlTimeuuid::from(msg.message_id),
+                msg.chat_id,
+                msg.sender_id,
+                &msg.content,
+            ));
+        }
+
+        self.session.batch(&batch, batch_values).await?;
+        Ok(())
+    }
     // TODO : Factorise function that fetch multiple rows
     async fn get_all_users(&self) -> Result<Vec<User>> {
         let users = self

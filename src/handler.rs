@@ -380,6 +380,7 @@ mod tests {
             async fn get_user_by_username(&self, username: &str) -> Result<User>;
             async fn get_all_users(&self) -> Result<Vec<User>>;
             async fn get_members_of_chat(&self, chat_id: Uuid) -> Result<Vec<Uuid>>;
+            async fn insert_batch_message(&self, messages: &[PandaMessage]) -> Result<()>;
         }
     }
 
